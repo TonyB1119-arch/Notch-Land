@@ -19,9 +19,13 @@ pub const LEFT: f32 = 30.0;
 pub const RIGHT: f32 = 54.0;
 pub const BOTTOM: f32 = 26.0;
 /// Height of the home page.
-pub const HOME_H: f32 = 142.0;
-/// Width of the column of load and battery readings on the right of the home page.
-const STATS_W: f32 = 140.0;
+pub const HOME_H: f32 = 118.0;
+/// The home page while the mirror's camera view is open: taller, so the picture has room.
+pub const HOME_MIRROR_H: f32 = 200.0;
+/// The even gap between the clock and the two small widgets beside it: as wide as there is room
+/// for, but never wider than GAP, and the sky label leaves the date line before it gets under MIN_GAP.
+const GAP: f32 = 32.0;
+const MIN_GAP: f32 = 22.0;
 
 /// How many dots show at once; the window follows the open page.
 const MAX_DOTS: usize = 7;
@@ -48,84 +52,112 @@ fn stage(i: usize) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-pub fn home(ui: &mut Ui, r: Rect, modules: &mut [Box<dyn Module>]) {
+pub fn home(ui: &mut Ui, full: Rect, modules: &mut [Box<dyn Module>]) {
+    // the widgets keep one compact size and stay at the top; only the camera view grows past them
+    let r = Rect::new(full.x, full.y, full.w, HOME_H.min(full.h));
     let base = ui.p.alpha;
-    // settings gear, top left
+    let mirror_on = ui.cfg.modules.is_enabled("mirror");
+    let covered = mirror_on && crate::modules::mirror::showing();
+    // settings gear, top left (the mirror's camera icon sits right beside it)
     let gear = Rect::new(r.x - 4.0, r.y - 8.0, 22.0, 22.0);
-    let hover = ui.hovered(gear);
+    let hover = !covered && ui.hovered(gear);
     if hover {
         ui.hot = true;
     }
     let a = ui.glide(gkey("alcove-gear", 0), if hover { 1.0 } else { 0.0 });
     ui.p.icon(Icon::Settings, gear, Color::white(0.45 + 0.45 * a));
-    if ui.clicked(gear) {
+    if !covered && ui.clicked(gear) {
         ui.fx.open_page = Some("settings");
     }
-
-    ui.p.alpha = base * stage(2);
-    side_stats(ui, r, modules);
-    ui.p.alpha = base * stage(1);
 
     let brief = crate::modules::weather::brief();
     let unit = if ui.cfg.weather.units == "imperial" { "F" } else { "C" };
 
-    // left: weather
-    let left_w = 150.0;
-    let wy = r.cy() - 35.0;
-    let mut left_end = r.x + left_w * 0.8;
-    match &brief {
+    // the three parts are measured first, so the gaps between them can be even
+    // left: the weather
+    let temp_style = TextStyle::new(30.0, Color::white(1.0)).semibold();
+    let place_style = TextStyle::new(13.0, palette::TEXT_DIM);
+    let off_style = TextStyle::new(13.0, palette::TEXT_FAINT);
+    let (temp_txt, place) = match &brief {
         Some(b) => {
-            b.draw_icon(ui.p, Rect::new(r.x, wy, 40.0, 40.0));
-            let temp = TextStyle::new(30.0, Color::white(1.0)).semibold();
-            let temp_txt = format!("{:.0}°{unit}", b.temp);
-            let (temp_w, _) = ui.p.measure(&temp_txt, &temp);
-            left_end = r.x + 50.0 + temp_w;
-            ui.p.text(&temp_txt, Rect::new(r.x + 50.0, wy - 2.0, left_w - 50.0, 44.0), &temp);
             let mut place = b.place.clone();
             if place.chars().count() > 18 {
                 place = place.chars().take(17).collect::<String>() + "…";
             }
-            ui.p.text(&place, Rect::new(r.x, wy + 48.0, left_w, 20.0), &TextStyle::new(13.0, palette::TEXT_DIM));
+            (format!("{:.0}°{unit}", b.temp), place)
         }
-        None => {
-            ui.p.icon(Icon::Cloud, Rect::new(r.x, wy, 36.0, 36.0), Color::white(0.3));
-            ui.p.text(
-                "Weather is off",
-                Rect::new(r.x + 46.0, wy, left_w, 36.0),
-                &TextStyle::new(13.0, palette::TEXT_FAINT),
-            );
-        }
-    }
-
-    // centre: the time, the date and the sky
-    ui.p.alpha = base * stage(0);
+        None => (String::new(), String::new()),
+    };
+    let temp_w = ui.p.measure(&temp_txt, &temp_style).0;
+    let place_w = ui.p.measure(&place, &place_style).0;
+    let left_w = if brief.is_some() {
+        (50.0 + temp_w).max(place_w)
+    } else {
+        46.0 + ui.p.measure("Weather is off", &off_style).0
+    };
+    // right: the readings
+    let (rows, lab_w, val_w) = stats_layout(ui, modules);
+    let right_w = lab_w + 12.0 + val_w;
+    // centre: the time and the date, in the middle of the notch
     let (h, m, _s, suffix, date) = crate::app::clock_parts();
     let time = format!("{h:02}:{m:02}");
-    let big = TextStyle::new(58.0, Color::white(1.0)).weight(700).center();
-    // halfway between the middle of the notch and the middle of the space between the weather
-    // and the readings, which looks centred with the page dots on the right
-    let cx = ((left_end + (r.right() - STATS_W)) * 0.5 + r.cx() + (RIGHT - LEFT) * 0.5) * 0.5;
-    let area = Rect::new(cx - 190.0, r.y, 380.0, r.h);
-    // the digits and the AM/PM mark are centred together, so the whole clock sits in the middle
-    let suffix_style = TextStyle::new(15.0, palette::TEXT_DIM).semibold();
+    let big = TextStyle::new(48.0, Color::white(1.0)).weight(700).center();
+    let suffix_style = TextStyle::new(14.0, palette::TEXT_DIM).semibold();
     let (tw, _) = ui.p.measure(&time, &big);
     let (sw, _) = if suffix.is_empty() { (0.0, 0.0) } else { ui.p.measure(&suffix, &suffix_style) };
-    let gap = if suffix.is_empty() { 0.0 } else { 8.0 };
-    let left = cx - (tw + gap + sw) * 0.5;
-    ui.p.text(&time, Rect::new(left - 4.0, r.y + 16.0, tw + 8.0, 72.0), &big);
-    if !suffix.is_empty() {
-        ui.p.text(&suffix, Rect::new(left + tw + gap, r.y + 40.0, sw + 8.0, 24.0), &suffix_style);
-    }
-    let sub = match &brief {
+    let gap = if suffix.is_empty() { 0.0 } else { 7.0 };
+    let clock_w = tw + gap + sw;
+    let sub_style = TextStyle::new(14.0, palette::TEXT_DIM).medium().center();
+    let mut sub = match &brief {
         Some(b) => format!("{date}  ·  {}", b.label),
-        None => date,
+        None => date.clone(),
     };
-    ui.p.text(
-        &sub,
-        Rect::new(area.x, r.y + 98.0, area.w, 24.0),
-        &TextStyle::new(15.0, palette::TEXT_DIM).medium().center(),
-    );
+    let cx = r.cx() + (RIGHT - LEFT) * 0.5;
+    let room = |block: f32| ((cx - block * 0.5) - r.x - left_w).min(r.right() - (cx + block * 0.5) - right_w);
+    let mut block = clock_w.max(ui.p.measure(&sub, &sub_style).0);
+    if room(block) < MIN_GAP {
+        // the sky label gives way before anything gets crowded
+        sub = date;
+        block = clock_w.max(ui.p.measure(&sub, &sub_style).0);
+    }
+    let g = room(block).clamp(14.0, GAP);
+    let wx = cx - block * 0.5 - g - left_w;
+    let sx = cx + block * 0.5 + g;
+
+    // draw: the weather
+    ui.p.alpha = base * stage(1);
+    let wy = r.cy() - 35.0;
+    match &brief {
+        Some(b) => {
+            b.draw_icon(ui.p, Rect::new(wx, wy, 40.0, 40.0));
+            ui.p.text(&temp_txt, Rect::new(wx + 50.0, wy - 2.0, temp_w + 8.0, 44.0), &temp_style);
+            ui.p.text(&place, Rect::new(wx, wy + 48.0, place_w + 8.0, 20.0), &place_style);
+        }
+        None => {
+            ui.p.icon(Icon::Cloud, Rect::new(wx, wy, 36.0, 36.0), Color::white(0.3));
+            ui.p.text("Weather is off", Rect::new(wx + 46.0, wy, left_w, 36.0), &off_style);
+        }
+    }
+    // the clock and the date
+    ui.p.alpha = base * stage(0);
+    let left = cx - clock_w * 0.5;
+    let ty = r.cy() - 51.0;
+    ui.p.text(&time, Rect::new(left - 4.0, ty, tw + 8.0, 62.0), &big);
+    if !suffix.is_empty() {
+        ui.p.text(&suffix, Rect::new(left + tw + gap, ty + 19.0, sw + 8.0, 24.0), &suffix_style);
+    }
+    ui.p.text(&sub, Rect::new(cx - block * 0.5 - 20.0, r.cy() + 17.0, block + 40.0, 24.0), &sub_style);
+    // the readings
+    ui.p.alpha = base * stage(2);
+    side_stats(ui, r, sx, &rows, lab_w, val_w);
     ui.p.alpha = base;
+
+    // the mirror: a camera icon next to the gear that opens a camera view over the page
+    if mirror_on {
+        if let Some(mi) = modules.iter_mut().find(|m| m.id() == "mirror") {
+            mi.draw_card(ui, full);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,36 +218,47 @@ pub fn rail(ui: &mut Ui, view: Rect, tabs: &[(ModuleId, Icon, String)], page: Mo
 
 /// Processor, memory and battery as a column on the right of the home page: each a small
 /// label with its value and a thin capsule gauge.
-fn side_stats(ui: &mut Ui, r: Rect, modules: &[Box<dyn Module>]) {
-    let x = r.right() - STATS_W;
-    let pitch = 30.0;
-    let mut y = r.cy() - pitch * 1.5 + 4.0;
-    let label = TextStyle::new(14.0, palette::TEXT_DIM).medium();
-    let value = TextStyle::new(17.0, Color::white(1.0)).semibold().right();
+/// The readings of the home page (name, number, warn) and the widths of the name and number columns.
+/// The numbers carry no percent sign; the column is the same width whatever the values are.
+fn stats_layout(ui: &mut Ui, modules: &[Box<dyn Module>]) -> (Vec<(&'static str, String, bool)>, f32, f32) {
     let mut inds = Vec::new();
     for m in modules.iter().filter(|m| m.id() == "battery") {
         m.indicators(&mut inds);
     }
     let battery = inds.iter().find_map(|i| i.battery);
-    let rows = [
-        ("Processor", crate::modules::stats::cpu_percent().map_or("--".to_string(), |v| format!("{v}%")), false),
-        ("Memory", crate::modules::stats::ram_percent().map_or("--".to_string(), |v| format!("{v}%")), false),
+    let rows = vec![
+        ("Processor", crate::modules::stats::cpu_percent().map_or("--".to_string(), |v| v.to_string()), false),
+        ("Memory", crate::modules::stats::ram_percent().map_or("--".to_string(), |v| v.to_string()), false),
         match battery {
             Some((level, charging)) => (
                 if charging { "Charging" } else { "Battery" },
-                format!("{:.0}%", level * 100.0),
+                format!("{:.0}", level * 100.0),
                 level < 0.2 && !charging,
             ),
             None => ("Battery", "AC".to_string(), false),
         },
     ];
+    let label = TextStyle::new(14.0, palette::TEXT_DIM).medium();
+    let value = TextStyle::new(17.0, Color::white(1.0)).semibold().right();
+    let lab_w = rows.iter().map(|(n, _, _)| ui.p.measure(n, &label).0).fold(0.0, f32::max);
+    let min_w = ui.p.measure("100", &value).0;
+    let val_w = rows.iter().map(|(_, t, _)| ui.p.measure(t, &value).0).fold(min_w, f32::max);
+    (rows, lab_w, val_w)
+}
+
+/// The readings, with their left edge at `x`: the name, a short gap, the number lined up on the right.
+fn side_stats(ui: &mut Ui, r: Rect, x: f32, rows: &[(&'static str, String, bool)], lab_w: f32, val_w: f32) {
+    let pitch = 30.0;
+    let mut y = r.cy() - pitch * 1.5 + 4.0;
+    let label = TextStyle::new(14.0, palette::TEXT_DIM).medium();
+    let value = TextStyle::new(17.0, Color::white(1.0)).semibold().right();
     for (name, txt, warn) in rows {
-        ui.p.text(name, Rect::new(x, y, STATS_W - 54.0, 24.0), &label);
+        ui.p.text(name, Rect::new(x, y, lab_w + 6.0, 24.0), &label);
         let mut v = value;
-        if warn {
+        if *warn {
             v.color = palette::RED;
         }
-        ui.p.text(&txt, Rect::new(x + STATS_W - 60.0, y, 60.0, 24.0), &v);
+        ui.p.text(txt, Rect::new(x + lab_w + 6.0, y, val_w + 6.0, 24.0), &v);
         y += pitch;
     }
 }

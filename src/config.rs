@@ -104,6 +104,12 @@ pub struct Appearance {
     pub bounce: f32,
     /// Animation speed multiplier (2.0 = twice as fast).
     pub animation_speed: f32,
+    /// Page switch length (Alcove): 1.0 = normal, 2.0 = twice as long.
+    pub page_time: f32,
+    /// Open notch closing length (Alcove): 1.0 = normal, 2.0 = twice as long.
+    pub close_time: f32,
+    /// Notch opening length (Alcove): 1.0 = normal, 2.0 = twice as long.
+    pub open_time: f32,
     /// "auto" (from album art) or "#RRGGBB".
     pub accent: String,
     /// Overall look: "beams" (glowing beams everywhere), "calm" (beams only on volume, brightness
@@ -130,6 +136,9 @@ pub struct Appearance {
     pub lite_motion: bool,
     /// Icons are drawn in white or grey whatever colour a page gives them (no coloured tints).
     pub mono_icons: bool,
+    /// Page switches: false = the page slides and fades (default), true = the old page blurs out
+    /// and the new one blurs in, in place.
+    pub page_blur: bool,
     /// Most frames a second the notch draws while it moves (30 - 240). 60 is smooth and light; raise it on a fast display for
     /// even smoother motion at a higher CPU cost.
     pub max_fps: f32,
@@ -146,9 +155,12 @@ impl Default for Appearance {
             collapsed_opacity: 1.0,
             expanded_opacity: 1.0,
             blur: true,
-            shadow: false,
+            shadow: true,
             bounce: 0.3,
             animation_speed: 1.0,
+            page_time: 1.0,
+            close_time: 1.0,
+            open_time: 1.0,
             accent: "auto".into(),
             look: "tuna".into(),
             white_beams: false,
@@ -159,6 +171,7 @@ impl Default for Appearance {
             glass_live: true,
             lite_motion: true,
             mono_icons: true,
+            page_blur: false,
             max_fps: 60.0,
             scale: 1.0,
         }
@@ -518,6 +531,8 @@ pub struct LauncherCfg {
     pub single_box: bool,
     /// The single box is a square in the middle of a narrower card (off = one wide box).
     pub square_box: bool,
+    /// The Alcove look only: the launcher hotkeys open the launcher inside the notch (false = Tuna's launcher).
+    pub alcove: bool,
     /// Handed over by the app, not stored here: the Gemini settings, whether media is playing, and
     /// the dock's rim (the launcher's rim follows it).
     #[serde(skip)]
@@ -545,6 +560,7 @@ impl Default for LauncherCfg {
             live: true,
             single_box: true,
             square_box: false,
+            alcove: true,
             search_url: "https://www.google.com/search?q=".to_string(),
             gemini: GeminiCfg::default(),
             media_playing: false,
@@ -1063,8 +1079,13 @@ impl Config {
         a.expanded_opacity = a.expanded_opacity.clamp(0.2, 1.0);
         a.bounce = a.bounce.clamp(0.0, 1.0);
         a.animation_speed = a.animation_speed.clamp(0.25, 4.0);
+        a.page_time = a.page_time.clamp(0.4, 2.5);
+        a.close_time = a.close_time.clamp(0.4, 2.5);
+        a.open_time = a.open_time.clamp(0.4, 2.5);
         a.scale = a.scale.clamp(0.5, 2.5);
         a.max_fps = a.max_fps.clamp(30.0, 240.0);
+        // the soft blur along the bottom edge was taken out
+        a.bottom_fade = false;
         self.clipboard.history = self.clipboard.history.clamp(1, 30);
         self.voice.max_seconds = self.voice.max_seconds.clamp(5, 780);
         self.osd.volume_step = self.osd.volume_step.clamp(1, 25);
@@ -1113,10 +1134,14 @@ expanded_width = 720
 collapsed_opacity = 1.0
 expanded_opacity = 1.0
 blur = true
-shadow = false
+shadow = true
 # 0 = no overshoot ... 1 = very bouncy
 bounce = 0.3
 animation_speed = 1.0
+# Alcove: how long a page switch, the notch closing and the notch opening take (1.0 = normal, higher = slower)
+page_time = 1.0
+close_time = 1.0
+open_time = 1.0
 # "tuna" (liquid glass, capsule gauges, control center, the launcher's deep blue), "alcove" (island layouts,
 # clock and weather home, page dots) or "nothing" (dot-matrix glyph lights, red accent)
 look = "tuna"
@@ -1138,6 +1163,8 @@ glass_live = true
 lite_motion = true
 # Monochrome icons: every icon is white or grey, no coloured tints or halos. false = coloured icons
 mono_icons = true
+# Page switches: false = the page slides and fades, true = the old page blurs out and the new one blurs in
+page_blur = false
 # Most frames a second while the notch moves (30 - 240). 60 is smooth and light; raise it on a fast display
 # for smoother motion at a higher CPU cost.
 max_fps = 60
@@ -1379,6 +1406,8 @@ live = true
 single_box = true
 # The single box is a square (false = one wide box); it still splits into two boxes when asked for
 square_box = false
+# The Alcove look only: the launcher hotkeys open the launcher inside the notch (false = Tuna's launcher)
+alcove = true
 # How big the launcher is (0.5 = half, 1.0 = the original size)
 size = 0.8
 # Where a web search goes; what you typed is added at the end

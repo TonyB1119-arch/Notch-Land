@@ -147,7 +147,7 @@ impl From<&crate::config::GlassCfg> for Tune {
             strength: g.strength.clamp(0.3, 1.0),
             corner: g.corner.clamp(0.0, 1.0),
             fringe: g.fringe.clamp(0.0, 0.2),
-            reach: g.reach.clamp(30.0, 200.0),
+            reach: 1.0, // extra height above the corner curve; the rim follows the bottom band (see draw)
             soft: g.softness.clamp(0.5, 12.0),
             mid: g.middle.clamp(0.0, 1.0),
             mid_warp: if g.stretch { 0.0 } else { g.middle_warp.clamp(0.0, 1.0) },
@@ -392,6 +392,9 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     // The middle: wherever the notch is even a little see-through (the strip along the bottom, or
     // the whole notch when the panel opacity is below 100 %) the glass carries on across it.
     let mid = t.mid > 0.01 && ((sh.band > 0.0 && sh.fade > 0.004) || sh.clear > 0.004);
+    // the corners rise exactly as high as the strip along the bottom and fade out with it, so the
+    // edge is even all the way across (without the strip they stay within the curve)
+    let reach = if mid { reach.max(sh.band) } else { reach };
     let int_top = if sh.clear > 0.004 { sh.top } else { sh.bottom - sh.band };
     let top_y = if mid { (sh.bottom - reach).min(int_top) } else { sh.bottom - reach };
     let x0 = ((sh.left - 2.0).floor() as i32).max(shot.ox);
@@ -424,12 +427,23 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
     let everywhere = t.sharp >= 3.95;
     let cell = if hybrid && !everywhere { 2_usize } else { 1 };
     let fine_d = if hybrid && !everywhere { width * t.sharp } else { f32::MAX };
+    // the corner curve of the Alcove notch is a superellipse (see `gfx::notch_path`); elsewhere a circle
+    let sq_n = if crate::ui::look_alcove() { crate::gfx::CORNER_N } else { 2.0 };
     // distance inside the edge, the direction pointing out of the notch, and the corner weight
     let geom = |x: f32, y: f32| -> (f32, f32, f32, f32) {
         if y > cb && (x < cl || x > cr) {
             let cx = if x < cl { cl } else { cr };
             let (dx, dy) = (x - cx, y - cb);
             let dist = (dx * dx + dy * dy).sqrt().max(0.001);
+            if sq_n > 2.01 {
+                // distance along the ray from the corner's centre to the curve, and the curve's normal
+                let (ax, ay) = ((dx.abs() / r).max(1e-4), (dy.abs() / r).max(1e-4));
+                let f = ax.powf(sq_n) + ay.powf(sq_n);
+                let d = (dist * (f.powf(-1.0 / sq_n) - 1.0)).min(r);
+                let (gx, gy) = (ax.powf(sq_n - 1.0) * dx.signum(), ay.powf(sq_n - 1.0) * dy.signum());
+                let gl = (gx * gx + gy * gy).sqrt().max(1e-4);
+                return (d, gx / gl, gy / gl, (2.0 * dx.abs() * dy / (dist * dist)).clamp(0.0, 1.0));
+            }
             // corner: 0 where the curve meets the straight edges, 1 in the middle of the curve (no seam)
             (r - dist, dx / dist, dy / dist, (2.0 * dx.abs() * dy / (dist * dist)).clamp(0.0, 1.0))
         } else {
@@ -453,7 +467,7 @@ pub fn rim(shot: &Shot, sh: Shape, step: usize) -> Option<Rim> {
         // how much of the middle shows on this row: the black thins toward the bottom edge
         let a_row = if in_mid {
             let bt = ((y - (sh.bottom - sh.band)) / band).clamp(0.0, 1.0);
-            let e = bt * bt * bt * (bt * (bt * 6.0 - 15.0) + 10.0);
+            let e = bt * bt * (3.0 - 2.0 * bt); // an even, gentle rise from black up to the colour
             (sh.fade * e).max(sh.clear) * t.mid
         } else {
             0.0

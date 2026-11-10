@@ -225,12 +225,9 @@ fn dial_height(p: &Peek, cfg: &Config) -> Option<f32> {
     if !crate::ui::look_alcove() {
         return None;
     }
-    match p.key {
-        Some("osd-volume" | "osd-brightness") if cfg.general.hud_ring => Some(150.0),
-        // the value sits inside the ring here too, so no extra room is needed under it
-        Some("battery" | "bluetooth") => Some(150.0),
-        _ => None,
-    }
+    // everything is the wide pill now (volume, brightness, battery, Bluetooth)
+    let _ = (p, cfg);
+    None
 }
 
 /// How wide each page wants the open notch, as a share of the widest setting (Appearance, width).
@@ -241,9 +238,10 @@ fn page_share(id: ModuleId) -> f32 {
         "notifications" | "timer" => 0.72,
         "downloads" | "clipboard" | "mirror" | "notes" => 0.74,
         "control" | "shelf" => 0.76,
-        "media" | "stats" | "weather" => 0.78,
+        "media" | "stats" | "weather" | "mixer" => 0.78,
         "calendar" | "ports" | "voice" | "ai" => 0.84,
-        "gemini" => 0.86,
+        "gemini" | "alcove-launcher" => 0.86,
+        "home" => 0.80,
         _ => 1.0,
     }
 }
@@ -260,7 +258,12 @@ fn page_width_of(cfg: &Config, id: ModuleId) -> f32 {
 /// The height a page wants under the header, for the given content width.
 fn page_content_h(cfg: &Config, modules: &[Box<dyn Module>], started: &[bool], id: ModuleId, content_w: f32) -> f32 {
     if id == HOME && crate::ui::look_alcove() {
-        crate::alcove::HOME_H
+        // taller while the mirror's camera view is open
+        if cfg.modules.is_enabled("mirror") && modules::mirror::showing() {
+            crate::alcove::HOME_MIRROR_H
+        } else {
+            crate::alcove::HOME_H
+        }
     } else if id == HOME && crate::ui::look_tuna() {
         crate::tuna::HOME_H
     } else if id == HOME && crate::ui::look_bloom() {
@@ -301,6 +304,170 @@ const SWAP_SECS: f32 = 0.55;
 const BODY_RESPONSE: f32 = 0.42;
 /// How long the body waits for the content to fade before it shrinks (seconds).
 const CLOSE_HOLD: f32 = 0.09;
+// ---------------------------------------------------------------------------
+// The soft blur of content coming and going (Alcove). Timed frame by frame from a reference
+// recording (30 fps): each curve is a list of (seconds, value) points joined by straight lines.
+// Opacity is 0..1; blur is the Gaussian radius in px at scale 1 (multiplied by BLUR_K).
+// ---------------------------------------------------------------------------
+/// Overall strength of the blur (1.0 = as strong as the reference).
+const BLUR_K: f32 = 0.85;
+// switching pages: the old page blurs and fades fast, the new one clears from a blur
+const PAGE_OLD_A: [(f32, f32); 6] = [(0.0, 1.0), (0.033, 0.95), (0.067, 0.7), (0.1, 0.52), (0.133, 0.38), (0.17, 0.0)];
+const PAGE_OLD_S: [(f32, f32); 6] = [(0.0, 0.0), (0.033, 1.5), (0.067, 5.0), (0.1, 8.0), (0.133, 9.0), (0.17, 9.0)];
+const PAGE_NEW_A: [(f32, f32); 10] = [
+    (0.0, 0.0),
+    (0.033, 0.49),
+    (0.067, 0.5),
+    (0.1, 0.63),
+    (0.133, 0.77),
+    (0.167, 0.84),
+    (0.2, 0.91),
+    (0.233, 0.97),
+    (0.267, 0.99),
+    (0.3, 1.0),
+];
+const PAGE_NEW_S: [(f32, f32); 11] = [
+    (0.0, 12.0),
+    (0.033, 12.0),
+    (0.067, 10.0),
+    (0.1, 7.0),
+    (0.133, 5.0),
+    (0.167, 3.0),
+    (0.2, 2.0),
+    (0.233, 1.5),
+    (0.267, 1.0),
+    (0.3, 0.5),
+    (0.367, 0.0),
+];
+/// How much slower the page switch plays than the reference (1.0 = same speed).
+const PAGE_T: f32 = 1.7;
+const PAGE_SECS: f32 = 0.37 * PAGE_T;
+/// How much faster the close plays than the reference (curve time = real time / this).
+const CLOSE_T: f32 = 0.8;
+// the open notch's content appearing (after the body has grown) ...
+const IN_A: [(f32, f32); 5] = [(0.0, 0.0), (0.033, 0.44), (0.067, 0.78), (0.1, 0.92), (0.133, 1.0)];
+const IN_S: [(f32, f32); 10] = [
+    (0.0, 16.0),
+    (0.033, 16.0),
+    (0.067, 8.0),
+    (0.1, 7.0),
+    (0.133, 6.0),
+    (0.167, 5.0),
+    (0.2, 4.0),
+    (0.233, 1.5),
+    (0.267, 0.5),
+    (0.3, 0.0),
+];
+const IN_END: f32 = 0.3;
+const OPEN_DELAY: f32 = 0.08;
+/// How much faster the content comes in than the reference (curve time = real time / this).
+const IN_T: f32 = 0.75;
+/// The body grows this much quicker when the notch opens (a spring response factor; smaller is faster).
+const OPEN_SPEED: f32 = 0.75;
+// ... and going: it blurs for a long moment, vanishes, and only then does the body snap small
+const OUT_A: [(f32, f32); 11] = [
+    (0.0, 1.0),
+    (0.033, 0.95),
+    (0.1, 0.9),
+    (0.267, 0.88),
+    (0.33, 0.85),
+    (0.43, 0.79),
+    (0.53, 0.7),
+    (0.63, 0.67),
+    (0.7, 0.45),
+    (0.77, 0.12),
+    (0.83, 0.0),
+];
+const OUT_S: [(f32, f32); 12] = [
+    (0.0, 0.0),
+    (0.033, 1.5),
+    (0.067, 2.0),
+    (0.1, 3.0),
+    (0.167, 5.0),
+    (0.2, 7.0),
+    (0.233, 8.0),
+    (0.267, 9.0),
+    (0.3, 10.0),
+    (0.4, 12.0),
+    (0.53, 14.0),
+    (0.83, 14.0),
+];
+const OUT_END: f32 = 0.83;
+/// When the body starts to shrink after the open notch is told to close.
+const OUT_BODY: f32 = 0.57;
+/// Content that comes back after a close (the media in the notch) waits for the body to be small.
+const RETURN_AFTER_CLOSE: f32 = 0.78;
+// peeks and the compact media content: the same idea, smaller and quicker
+const PIN_A: [(f32, f32); 3] = [(0.0, 0.0), (0.04, 0.5), (0.1, 1.0)];
+const PIN_S: [(f32, f32); 7] = [(0.0, 8.0), (0.04, 8.0), (0.08, 5.0), (0.12, 3.0), (0.16, 1.5), (0.22, 0.5), (0.26, 0.0)];
+const PIN_END: f32 = 0.26;
+const PEEK_DELAY: f32 = 0.06;
+const POUT_A: [(f32, f32); 5] = [(0.0, 1.0), (0.05, 0.92), (0.15, 0.8), (0.21, 0.5), (0.27, 0.0)];
+const POUT_S: [(f32, f32); 5] = [(0.0, 0.0), (0.05, 2.0), (0.1, 4.0), (0.16, 6.0), (0.27, 7.0)];
+const POUT_END: f32 = 0.27;
+/// When a peek's body starts to shrink after the peek has ended.
+const POUT_BODY: f32 = 0.22;
+
+/// How a piece of content looks right now while it comes or goes.
+#[derive(Clone, Copy)]
+struct Layer {
+    alpha: f32,
+    /// blur radius in reference px (before `BLUR_K` and the display scale)
+    sigma: f32,
+}
+
+/// What each kind of content is doing this frame; None when it is settled (crisp, or not there).
+#[derive(Clone, Copy, Default)]
+struct VeilFrame {
+    exp: Option<Layer>,
+    peek: Option<Layer>,
+    act: Option<Layer>,
+}
+
+/// When a piece of content last started to appear (`on`) or disappear, so its blur can be timed.
+#[derive(Clone, Copy)]
+struct Veil {
+    on: bool,
+    at: Instant,
+}
+
+impl Veil {
+    fn idle() -> Veil {
+        // long ago: nothing is animating at start-up
+        Veil { on: false, at: Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now) }
+    }
+}
+
+/// The value of a curve at `t` seconds.
+fn curve(pts: &[(f32, f32)], t: f32) -> f32 {
+    if t <= pts[0].0 {
+        return pts[0].1;
+    }
+    for w in pts.windows(2) {
+        if t <= w[1].0 {
+            let k = (t - w[0].0) / (w[1].0 - w[0].0).max(1e-6);
+            return w[0].1 + (w[1].1 - w[0].1) * k;
+        }
+    }
+    pts[pts.len() - 1].1
+}
+
+/// A pair of curves `t` seconds in; None once it is over.
+fn run(a: &[(f32, f32)], s: &[(f32, f32)], t: f32, end: f32) -> Option<Layer> {
+    if t >= end {
+        return None;
+    }
+    let t = t.max(0.0);
+    Some(Layer { alpha: curve(a, t), sigma: curve(s, t) })
+}
+
+/// The old and the new page, `t` seconds after a page switch.
+fn page_layers(t: f32, m: f32) -> (Option<Layer>, Layer) {
+    let t = t / (PAGE_T * m);
+    let old = run(&PAGE_OLD_A, &PAGE_OLD_S, t, PAGE_OLD_A[5].0);
+    let new = Layer { alpha: curve(&PAGE_NEW_A, t), sigma: curve(&PAGE_NEW_S, t) };
+    (old, new)
+}
 
 struct Anim {
     w: Spring,
@@ -433,6 +600,24 @@ pub struct App {
     snap_pages: Option<(Snapshot, Snapshot)>,
     /// The bottom strip of the open page, for the soft blur along the bottom edge (Alcove).
     snap_band: Option<Snapshot>,
+    /// A peek and the compact live activity while they fade in or out, redrawn into re-used pictures
+    /// each frame so they can be shown going soft (see `prepare_small`). None whenever they are crisp.
+    snap_peek: Option<Snapshot>,
+    /// When the open notch, the peeks and the compact activity last came or went (for the soft blur).
+    veil_exp: Veil,
+    veil_peek: Veil,
+    veil_act: Veil,
+    /// What they are doing this frame.
+    vf: VeilFrame,
+    /// The peek that has just ended, kept while it blurs away.
+    peek_out: Option<ActivePeek>,
+    /// When the page last changed.
+    page_at: Instant,
+    snap_act: Option<Snapshot>,
+    /// The widest the notch gets during the current move: the pictures are made this size, so their buffers are re-used.
+    small_dim: (f32, f32),
+    /// Where the compositor-drawn bars go, as worked out when the activity picture was drawn.
+    small_bars: Option<(Rect, Color, bool)>,
     /// Set if the blended bottom strip could not be made: the notch then stays solid, no see-through edge.
     band_failed: bool,
     /// Alcove glass edge: a copy of the screen behind the notch, taken as it opens, the rim worked
@@ -605,6 +790,16 @@ impl App {
             snap_all: None,
             snap_pages: None,
             snap_band: None,
+            snap_peek: None,
+            veil_exp: Veil::idle(),
+            veil_peek: Veil::idle(),
+            veil_act: Veil::idle(),
+            vf: VeilFrame::default(),
+            peek_out: None,
+            page_at: Instant::now(),
+            snap_act: None,
+            small_dim: (0.0, 0.0),
+            small_bars: None,
             band_failed: false,
             refr_shot: None,
             refr_rim: None,
@@ -1223,6 +1418,7 @@ impl App {
         };
         let dir = if pos(new) >= pos(self.page) { 1.0 } else { -1.0 };
         self.page_from = Some((self.page, dir));
+        self.page_at = Instant::now();
         self.page = new;
         self.anim.page.snap(0.0);
         self.anim.page.set_target(1.0);
@@ -1406,7 +1602,7 @@ impl App {
             if let Some(h) = self.hover_since {
                 if now >= h + Duration::from_millis(hover_delay_ms as u64) {
                     self.hover_since = None;
-                    let page = self.peek.as_ref().and_then(|p| p.peek.page);
+                    let page = self.peek.as_ref().and_then(|p| p.peek.page).or_else(|| self.media_target(self.input.mouse));
                     self.expand(page);
                 }
             }
@@ -1426,8 +1622,14 @@ impl App {
                 {
                     push_bubble(&mut self.bubbles, now, p.peek.icon, p.peek.accent, false, p.peek.page);
                 }
-                self.peek = None;
+                let gone = self.peek.take();
+                if crate::ui::look_alcove() && self.cfg.appearance.motion_cache {
+                    self.peek_out = gone;
+                }
                 self.next_peek();
+                if self.peek.is_some() {
+                    self.peek_out = None;
+                }
             }
         }
     }
@@ -1500,7 +1702,8 @@ impl App {
             if self.user_hidden {
                 self.user_hidden = false;
             }
-            self.expand(None);
+            // with a track playing the hotkey opens Home too, not the media page
+            self.expand(self.media_target(None));
         }
     }
 
@@ -1745,6 +1948,24 @@ impl App {
         Rect::new(b.right() - s + (s + 8.0) * k, b.y.min(0.0), s, s)
     }
 
+    /// With a track playing in the Alcove look, only its cover and level bars lead to the media
+    /// page; the rest of the closed notch opens Home. `None`: no media activity is showing, so the
+    /// caller keeps its usual choice of page.
+    fn media_target(&self, at: Option<(f32, f32)>) -> Option<ModuleId> {
+        let a = self.activity.as_ref().filter(|a| a.page == Some("media"))?;
+        let on_media = at.is_some_and(|(x, y)| {
+            if self.anim.split.value > 0.5 {
+                let (l, r) = self.split_rects();
+                l.expand(4.0).contains(x, y) || r.expand(4.0).contains(x, y)
+            } else {
+                let b = self.body_rect();
+                let w = a.wing * self.cfg.appearance.notch_height + 4.0;
+                Rect::new(b.x, b.y, w, b.h).contains(x, y) || Rect::new(b.right() - w, b.y, w, b.h).contains(x, y)
+            }
+        });
+        Some(if on_media { "media" } else { HOME })
+    }
+
     fn hover_zone(&self) -> Rect {
         let b = self.body_rect();
         let strip_w = self.cfg.appearance.notch_width;
@@ -1833,7 +2054,10 @@ impl App {
                     self.next_peek();
                 }
                 None => {
-                    let page = self.peek.as_ref().and_then(|a| a.peek.page);
+                    // the volume text of the volume peek opens the mixer
+                    let on_volume = self.peek.as_ref().is_some_and(|a| a.peek.key == Some("osd-volume"))
+                        && HUD_TEXT.with(|z| z.get()).is_some_and(|z| z.contains(p.0, p.1));
+                    let page = if on_volume { Some(modules::mixer::ID) } else { self.peek.as_ref().and_then(|a| a.peek.page) };
                     self.expand(page);
                 }
             },
@@ -1867,7 +2091,7 @@ impl App {
                     }
                     // with the media split into two bubbles the notch between them is blank: a click
                     // there opens Home, while the bubbles themselves open the media page
-                    let page = if self.anim.split.value > 0.5 { Some(HOME) } else { None };
+                    let page = self.media_target(Some(p)).or(if self.anim.split.value > 0.5 { Some(HOME) } else { None });
                     self.expand(page);
                 }
             }
@@ -2260,7 +2484,7 @@ impl App {
                 let content_h = page_content_h(&self.cfg, &self.modules, &self.started, self.page, content_w);
                 t.w = page_w;
                 t.h = top_h() + content_h + bottom_pad();
-                t.r = if crate::ui::look_alcove() { 46.0 } else { 34.0 };
+                t.r = if crate::ui::look_alcove() { (t.h * 0.23).clamp(34.0, 86.0) } else { 34.0 };
                 t.ear = 30.0;
                 t.glass = 1.0;
                 t.exp = true;
@@ -2268,12 +2492,9 @@ impl App {
             Mode::Peek => {
                 let pk = self.peek.as_ref().map(|a| &a.peek);
                 if pk.is_some_and(|p| p.scan) && crate::ui::look_alcove() {
-                    // unlock: a round dial like the volume one, with "Hello" and the name under it
-                    let name = hello_name(pk.map_or("", |p| p.title.as_str()));
-                    t.w = crate::alcove::hello_stage(name).0.min(ap.expanded_width);
-                    t.h = base_h + crate::alcove::hello_stage(name).1;
-                    t.r = 44.0;
-                    t.ear = 26.0;
+                    // unlock: the notch just gets wider, a padlock at the left and the word at the right
+                    t.w = 260.0_f32.min(ap.expanded_width);
+                    t.h = base_h;
                 } else if pk.is_some_and(|p| p.scan) {
                     // unlock scan: the notch grows into a small square stage, then
                     // settles into a smaller one for the handwritten hello
@@ -2296,6 +2517,14 @@ impl App {
                     }
                     t.r = 34.0;
                     t.ear = 28.0;
+                } else if pk.is_some_and(status_pill) {
+                    // caps lock, microphone, USB drive: the name at the left, the state at the right
+                    t.w = 300.0_f32.min(ap.expanded_width);
+                    t.h = base_h;
+                } else if pk.is_some_and(bt_pill) {
+                    // a device connecting: the notch just gets wider, earbuds at the left, level ring at the right
+                    t.w = (base_w + 40.0).max(220.0).min(ap.expanded_width);
+                    t.h = base_h;
                 } else if let Some(dh) = pk.and_then(|p| dial_height(p, &self.cfg)) {
                     // volume / brightness / battery / Bluetooth as one big round dial
                     t.w = 190.0_f32.min(ap.expanded_width);
@@ -2303,11 +2532,16 @@ impl App {
                     t.r = 44.0;
                     t.ear = 26.0;
                 } else if pk.is_some_and(|p| p.is_hud()) {
-                    // volume / brightness: one row, icon + beams + value
-                    t.w = 300.0_f32.min(ap.expanded_width);
-                    t.h = base_h + 34.0 + band_room(&self.cfg);
-                    t.r = 26.0;
-                    t.ear = 18.0;
+                    // volume / brightness / battery: one row, icon + bar + value (Alcove: only wider)
+                    if crate::ui::look_alcove() {
+                        t.w = 350.0_f32.min(ap.expanded_width);
+                        t.h = base_h;
+                    } else {
+                        t.w = 300.0_f32.min(ap.expanded_width);
+                        t.h = base_h + 34.0 + band_room(&self.cfg);
+                        t.r = 26.0;
+                        t.ear = 18.0;
+                    }
                 } else if pk.is_some_and(|p| p.is_compact()) {
                     // icon-only pill, like the unlock animation
                     t.w = (base_w + 70.0).max(250.0).min(ap.expanded_width);
@@ -2318,8 +2552,9 @@ impl App {
                     // a message: avatar, name and two lines of text
                     t.w = (base_w + 190.0).max(430.0).min(ap.expanded_width);
                     t.h = base_h + 58.0 + band_room(&self.cfg);
-                    t.r = 40.0;
-                    t.ear = 24.0;
+                    // smooth, generous corners in the proportion of the open notch's
+                    t.r = (t.h * 0.30).clamp(20.0, 34.0);
+                    t.ear = 16.0;
                 } else if pk.is_some_and(crate::alcove::peek_conn) && crate::ui::look_alcove() {
                     // a device or network: small and left-weighted
                     t.w = (base_w + 70.0).max(280.0).min(ap.expanded_width);
@@ -2330,8 +2565,9 @@ impl App {
                     // a notice with a message: the text sits in its own box under the title
                     t.w = (base_w + 190.0).max(430.0).min(ap.expanded_width);
                     t.h = base_h + 92.0 + band_room(&self.cfg);
-                    t.r = 40.0;
-                    t.ear = 24.0;
+                    // smooth, generous corners in the proportion of the open notch's
+                    t.r = (t.h * 0.30).clamp(20.0, 34.0);
+                    t.ear = 16.0;
                 } else if crate::ui::look_alcove() {
                     t.w = (base_w + 170.0).max(400.0).min(ap.expanded_width);
                     t.h = base_h + 46.0 + band_room(&self.cfg);
@@ -2389,11 +2625,36 @@ impl App {
 
     fn retarget(&mut self) {
         let t = self.targets();
+        // note when the open notch, a peek and the compact activity start to come or go
+        {
+            let now = Instant::now();
+            let sp = self.cfg.appearance.animation_speed.max(0.25);
+            let cm = self.cfg.appearance.close_time;
+            if self.veil_exp.on != t.exp {
+                self.veil_exp = Veil { on: t.exp, at: now };
+            }
+            // content that comes back right after a close waits until the body has shrunk
+            let wait = |exp: &Veil, now: Instant| -> Instant {
+                let back = exp.at + Duration::from_secs_f32(RETURN_AFTER_CLOSE * cm / sp);
+                if !exp.on && back > now {
+                    back
+                } else {
+                    now
+                }
+            };
+            if self.veil_peek.on != t.peek {
+                self.veil_peek = Veil { on: t.peek, at: if t.peek { wait(&self.veil_exp, now) } else { now } };
+            }
+            if self.veil_act.on != t.compact {
+                self.veil_act = Veil { on: t.compact, at: if t.compact { wait(&self.veil_exp, now) } else { now } };
+            }
+        }
         let split = self.split_media();
         let ap = &self.cfg.appearance;
         let speed = ap.animation_speed;
         let nothing = crate::ui::look_nothing();
         let alcove = crate::ui::look_alcove();
+        let veils = alcove && self.cfg.appearance.motion_cache;
         let bloom = (crate::ui::look_bloom() && !alcove) || crate::ui::look_tuna();
         // Bloom settles like a smooth ease-out: almost no overshoot
         let bounce = if nothing {
@@ -2413,6 +2674,12 @@ impl App {
         } else {
             speed
         };
+        let sp = speed.max(0.25);
+        let (cm, om) = (self.cfg.appearance.close_time, self.cfg.appearance.open_time);
+        let e_exp = Instant::now().saturating_duration_since(self.veil_exp.at).as_secs_f32() * sp;
+        let e_peek = Instant::now().saturating_duration_since(self.veil_peek.at).as_secs_f32() * sp;
+        // the open notch is on its way out (only that close is made quicker)
+        let leaving = !t.exp && if veils { e_exp < OUT_BODY * cm + 0.4 } else { self.anim.exp.value > 0.05 };
         let a = &mut self.anim;
         // page changes follow the animation speed setting too
         a.page.set_params(1.05 / speed, 1.0);
@@ -2421,9 +2688,12 @@ impl App {
         // object): a little softer on the way out, snappier on the way back in.
         let (resp, damp) = if grow {
             // Alcove: a visible but gentle overshoot on the way out
-            (BODY_RESPONSE / speed, if alcove { 1.0 - 0.8 * bounce } else { 1.0 - 0.45 * bounce })
+            (
+                BODY_RESPONSE * if alcove && t.exp { OPEN_SPEED * om } else { 1.0 } / speed,
+                if alcove { 1.0 - 0.8 * bounce } else { 1.0 - 0.45 * bounce },
+            )
         } else {
-            (BODY_RESPONSE * 0.7 / speed, 1.0 - 0.1 * bounce)
+            (BODY_RESPONSE * if alcove && leaving { 0.5 } else { 0.7 } / speed, 1.0 - 0.1 * bounce)
         };
         // Shape morphing: height leads, width follows a beat later and the corners keep
         // catching up, so the notch flows from one form to the other instead of scaling.
@@ -2441,8 +2711,18 @@ impl App {
         a.ear.set_params(resp * kr, damp.max(0.9));
         // Staged like the Mac apps: when closing, the content fades first and the body only then
         // shrinks around the empty space; when opening, the body leads and the content follows.
-        let closing = !grow && !t.exp && a.exp.value > 0.05;
-        let hold = if closing { CLOSE_HOLD / speed } else { 0.0 };
+        let closing = !grow && !t.exp && if veils { e_exp < OUT_BODY * cm } else { a.exp.value > 0.05 };
+        let hold = if closing {
+            if veils {
+                (OUT_BODY * cm - e_exp).max(0.0) / sp
+            } else {
+                CLOSE_HOLD / speed
+            }
+        } else if veils && !grow && !t.exp && !t.peek && self.peek_out.is_some() && e_peek < POUT_BODY {
+            (POUT_BODY - e_peek).max(0.0) / sp
+        } else {
+            0.0
+        };
         a.w.set_target_delayed(t.w, hold);
         a.h.set_target_delayed(t.h, hold);
         a.r.set_target_delayed(t.r, hold);
@@ -2454,17 +2734,19 @@ impl App {
         a.split.set_target(if split && t.shown { 1.0 } else { 0.0 });
         a.sec.set_params(0.45 / speed, 1.0 - 0.6 * bounce);
         a.sec.set_target(if t.sec { 1.0 } else { 0.0 });
+        let out = 0.12;
         let fade = |s: &mut Spring, on: bool, delay: f32| {
             if on {
                 s.set_params(0.24 / speed, 1.0);
                 s.set_target_delayed(1.0, delay / speed);
             } else {
-                s.set_params(0.12 / speed, 1.0);
+                s.set_params(out / speed, 1.0);
                 s.set_target(0.0);
             }
         };
-        fade(&mut a.compact, t.compact, 0.03);
-        fade(&mut a.peek, t.peek, 0.04);
+        let back = if veils && closing { RETURN_AFTER_CLOSE * cm } else { 0.0 };
+        fade(&mut a.compact, t.compact, 0.03 + back);
+        fade(&mut a.peek, t.peek, 0.04 + back);
         fade(&mut a.exp, t.exp, 0.09);
     }
 
@@ -2511,8 +2793,16 @@ impl App {
         self.retarget();
         let moving = self.anim.step(dt);
         self.tail = moving && self.anim.creeping();
-        if self.page_from.is_some() && self.anim.page.value > 0.998 && self.anim.page.target >= 1.0 {
-            self.page_from = None;
+        if self.page_from.is_some() {
+            let done = if crate::ui::look_alcove() && self.cfg.appearance.motion_cache {
+                now.saturating_duration_since(self.page_at).as_secs_f32() * self.cfg.appearance.animation_speed.max(0.25)
+                    >= PAGE_SECS * self.cfg.appearance.page_time
+            } else {
+                self.anim.page.value > 0.998 && self.anim.page.target >= 1.0
+            };
+            if done {
+                self.page_from = None;
+            }
         }
         self.settled = !moving;
         let t_draw = self.debug.then(Instant::now);
@@ -2646,7 +2936,13 @@ impl App {
                 self.modules
                     .iter()
                     .enumerate()
-                    .filter(|(i, m)| self.started[*i] && m.has_page() && m.id() != "settings")
+                    .filter(|(i, m)| {
+                        self.started[*i]
+                            && m.has_page()
+                            && m.id() != "settings"
+                            && m.id() != modules::alcove_launcher::ID
+                            && m.id() != modules::mixer::ID
+                    })
                     .map(|(_, m)| (m.id(), m.icon(), String::new())),
             )
             .collect();
@@ -2879,7 +3175,14 @@ impl App {
         let bhh = BAND_H.min(body.h * 0.4);
         let band_on = ap.bottom_fade && ap.blur && self.page != "settings" && body.h > bhh * 2.0;
         let opaque = if ap.blur { ap.expanded_opacity } else { ap.expanded_opacity.max(0.95) };
-        let band_px = if band_on { bhh * self.cfg.glass.fade_start.clamp(0.5, 3.0) * sc } else { 0.0 };
+        // the colour fades out slowly and is gone (pure black) at half the height of the notch (the
+        // "Bottom fade start" setting moves that point; 1.7 is half). Rounded to steps of 8 so the glass
+        // is not rebuilt for every tiny change while the size settles.
+        let band_px = if band_on {
+            ((body.h * (self.cfg.glass.fade_start.clamp(0.5, 3.0) / 3.4) * sc) / 8.0).round().max(1.0) * 8.0
+        } else {
+            0.0
+        };
         let fade_to = if band_on { self.cfg.glass.fade_amount.clamp(0.0, 1.0) } else { 0.0 };
         let clear = (1.0 - opaque).clamp(0.0, 1.0);
         let extra = ((band_px * 4.0) as i32, (fade_to * 1000.0) as i32, (clear * 1000.0) as i32);
@@ -2894,8 +3197,8 @@ impl App {
             band: band_px,
             fade: fade_to,
             clear,
-            left: body.x * sc,
-            right: body.right() * sc,
+            left: (body.x + crate::gfx::wall_taper(body.h) * 0.5) * sc,
+            right: (body.right() - crate::gfx::wall_taper(body.h) * 0.5) * sc,
             bottom: body.bottom() * sc,
             radius: r * sc,
             scale: sc,
@@ -3131,7 +3434,10 @@ impl App {
     /// every text, icon and beam again). Drawn live again as soon as the motion has settled.
     fn prepare_snapshots(&mut self, now: Instant) {
         let t0 = self.debug.then(Instant::now);
+        self.update_veils(now);
         self.prepare_pictures(now);
+        self.prepare_small(now);
+        self.prepare_blur(now);
         let t1 = self.debug.then(Instant::now);
         // (the blurred strip is drawn without the outline: it is a soft copy of the page anyway)
         self.res.set_halo(None);
@@ -3159,12 +3465,168 @@ impl App {
         band_on.then(|| bottom - bhh * self.cfg.glass.fade_start.clamp(0.5, 3.0) * 0.6)
     }
 
+    /// While a peek (volume, brightness, battery, a notification, the unlock greeting ...) or the
+    /// compact live activity fades in or out, its content is drawn into a small picture on every
+    /// frame, so it can be shown going soft: the same look as the page switch. The pictures cover
+    /// the notch at its widest during the move, so the buffers are re-used (nothing is allocated per
+    /// frame), and both are let go the moment the content is crisp again: nothing is kept while idle.
+    /// Work out what the open notch, the peeks and the compact activity are doing this frame.
+    fn update_veils(&mut self, now: Instant) {
+        let mut f = VeilFrame::default();
+        if crate::ui::look_alcove() && self.cfg.appearance.motion_cache {
+            let sp = self.cfg.appearance.animation_speed.max(0.25);
+            let (cm, om) = (self.cfg.appearance.close_time, self.cfg.appearance.open_time);
+            let el = |v: &Veil| now.saturating_duration_since(v.at).as_secs_f32() * sp;
+            let e = el(&self.veil_exp);
+            f.exp = if self.veil_exp.on {
+                run(&IN_A, &IN_S, (e - OPEN_DELAY * om) / (IN_T * om), IN_END)
+            } else {
+                run(&OUT_A, &OUT_S, e / (CLOSE_T * cm), OUT_END)
+            };
+            // (with the notch open, peeks and the activity are not shown at all)
+            if !self.veil_exp.on {
+                let e = el(&self.veil_peek);
+                f.peek = if self.veil_peek.on {
+                    self.peek.as_ref().and_then(|_| run(&PIN_A, &PIN_S, e - PEEK_DELAY, PIN_END))
+                } else {
+                    self.peek_out.as_ref().and_then(|_| run(&POUT_A, &POUT_S, e, POUT_END))
+                };
+                let e = el(&self.veil_act);
+                if self.veil_act.on && self.activity.is_some() {
+                    f.act = run(&PIN_A, &PIN_S, e - PEEK_DELAY, PIN_END)
+                        .map(|l| Layer { sigma: l.sigma * 0.75, ..l });
+                }
+            }
+        }
+        // the picture of a peek that has gone is let go once its blur-out is over
+        if self.peek_out.is_some() && (self.veil_peek.on || f.peek.is_none()) {
+            self.peek_out = None;
+        }
+        self.vf = f;
+    }
+
+    /// Blur the pictures that are fading this frame (see `Res::blur_snapshot`); the others let go
+    /// of their blur pictures so no memory is kept while nothing animates.
+    fn prepare_blur(&mut self, now: Instant) {
+        let k = BLUR_K * self.scale;
+        let res = &mut self.res;
+        let mut go = |s: &mut Option<Snapshot>, l: Option<Layer>| {
+            if let Some(s) = s.as_mut() {
+                match l {
+                    Some(l) => {
+                        res.blur_snapshot(s, l.sigma * k);
+                    }
+                    None => s.release_blur(),
+                }
+            }
+        };
+        go(&mut self.snap_all, self.vf.exp);
+        go(&mut self.snap_peek, self.vf.peek);
+        go(&mut self.snap_act, self.vf.act);
+        let paging = self.page_from.is_some() && crate::ui::look_alcove() && self.cfg.appearance.motion_cache;
+        if let Some((a, b)) = self.snap_pages.as_mut() {
+            if paging {
+                let e = now.saturating_duration_since(self.page_at).as_secs_f32()
+                    * self.cfg.appearance.animation_speed.max(0.25);
+                let (old_l, new_l) = page_layers(e, self.cfg.appearance.page_time);
+                match old_l {
+                    Some(l) => {
+                        res.blur_snapshot(a, l.sigma * k);
+                    }
+                    None => a.release_blur(),
+                }
+                res.blur_snapshot(b, new_l.sigma * k);
+            } else {
+                a.release_blur();
+                b.release_blur();
+            }
+        }
+    }
+
+    fn prepare_small(&mut self, now: Instant) {
+        let on = crate::ui::look_alcove()
+            && self.cfg.appearance.motion_cache
+            && self.snap_band.is_none()
+            && self.mode != Mode::Expanded;
+        let want_peek = on
+            && self.vf.peek.is_some()
+            && self.peek.as_ref().or(self.peek_out.as_ref()).is_some_and(|pk| pk.swap.is_none());
+        let want_act = on && self.vf.act.is_some() && self.activity.is_some() && self.anim.split.value <= 0.01;
+        if !want_peek {
+            self.snap_peek = None;
+        }
+        if !want_act {
+            self.snap_act = None;
+            self.small_bars = None;
+        }
+        if !(want_peek || want_act) {
+            self.small_dim = (0.0, 0.0);
+            return;
+        }
+        let body = self.body_rect();
+        let tgt = self.targets();
+        self.small_dim.0 = self.small_dim.0.max(body.w).max(tgt.w);
+        self.small_dim.1 = self.small_dim.1.max(body.h).max(tgt.h);
+        let rw = (self.small_dim.0 / 16.0).ceil() * 16.0 + 16.0;
+        let rh = (self.small_dim.1 / 8.0).ceil() * 8.0 + 8.0;
+        let x = (body.cx() - rw * 0.5).round();
+        let (x0, y0) = (x.max(0.0), body.y.max(0.0));
+        let (x1, y1) = ((x + rw).min(self.win_w), (body.y + rh).min(self.win_h));
+        let region = Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0));
+        let scale = self.scale;
+        let accent = self.accent;
+        let input = Input::default();
+        let mut scratch = Effects::default();
+        if want_peek {
+            let reuse = self.snap_peek.take();
+            if let Some(pk) = self.peek.as_ref().or(self.peek_out.as_ref()) {
+                let left =
+                    (pk.until.saturating_duration_since(now).as_secs_f32() / pk.peek.duration.as_secs_f32().max(0.1))
+                        .clamp(0.0, 1.0);
+                self.snap_peek = self.res.render_snapshot(&self.gfx, scale, region, 7, reuse, true, |p| {
+                    let mut ui = Ui {
+                        p,
+                        input: &input,
+                        fx: &mut scratch,
+                        cfg: &self.cfg,
+                        bus: &self.bus,
+                        now,
+                        accent,
+                        hot: false,
+                        interactive: false,
+                    };
+                    draw_peek(&mut ui, body, &pk.peek, left, None);
+                });
+            }
+        }
+        if want_act {
+            let reuse = self.snap_act.take();
+            let mut bars: Option<(Rect, Color, bool)> = None;
+            let acts = self.activity.as_ref();
+            self.snap_act = self.res.render_snapshot(&self.gfx, scale, region, 8, reuse, true, |p| {
+                let mut ui = Ui {
+                    p,
+                    input: &input,
+                    fx: &mut scratch,
+                    cfg: &self.cfg,
+                    bus: &self.bus,
+                    now,
+                    accent,
+                    hot: false,
+                    interactive: false,
+                };
+                draw_compact(&mut ui, body, acts, &self.indicators, self.cfg.appearance.notch_height, &mut bars);
+            });
+            self.small_bars = bars;
+        }
+    }
+
     fn prepare_pictures(&mut self, now: Instant) {
         let a_exp = self.anim.exp.value;
         let paging = self.page_from.is_some();
         let on = self.cfg.appearance.motion_cache;
         // the live view takes over a little before the end, so clicks work as soon as they used to
-        let want_all = on && a_exp > 0.003 && a_exp < 0.88 && !paging;
+        let want_all = on && !paging && (self.vf.exp.is_some() || (a_exp > 0.003 && a_exp < 0.88));
         let want_pages = on && paging && a_exp >= 0.998;
         if !want_all {
             self.snap_all = None;
@@ -3374,6 +3836,10 @@ impl App {
         let a_peek = self.anim.peek.value;
         let a_exp = self.anim.exp.value;
         crate::alcove::set_open(a_exp);
+        let (vexp, vpeek, vact) = (self.vf.exp, self.vf.peek, self.vf.act);
+        let veils = crate::ui::look_alcove() && self.cfg.appearance.motion_cache;
+        let page_e = now.saturating_duration_since(self.page_at).as_secs_f32()
+            * self.cfg.appearance.animation_speed.max(0.25);
         let target_h = self.targets().h;
         // read before the painter borrows the window's resources
         let page_w = self.page_width();
@@ -3418,11 +3884,11 @@ impl App {
             let mut p = Painter::new(dc.clone(), &self.gfx, &mut self.res, scale, off.x as f32, off.y as f32);
             p.clear();
             if body.bottom() > 0.25 || !bubble_list.is_empty() {
-                // shadow
-                if ap.shadow && a_glass > 0.01 {
-                    // extend above the window so only the sides/bottom show
-                    let sr = Rect::new(body.x, body.y - 60.0, body.w, body.h + 60.0);
-                    p.shadow(sr, a_r, 0.5 * a_glass);
+                // shadow: follows the notch's own outline, and only shows once the notch is open or
+                // showing a peek, never for the small collapsed (or hovered) notch
+                if ap.shadow {
+                    let grown = ((body.h - ap.notch_height - 18.0) / 60.0).clamp(0.0, 1.0);
+                    p.notch_shadow(body, a_r, a_ear, 0.5 * smoothstep(0.0, 1.0, grown));
                 }
                 // secondary activity bubble (drawn first; the main body covers it while sliding out)
                 let sec_v = self.anim.sec.value;
@@ -3502,26 +3968,20 @@ impl App {
                         // Alcove: the glass turns see-through toward the bottom edge
                         // it starts higher up and follows a gentle S, so there is no point where the
                         // black visibly begins to thin out
-                        let from = 1.0 - bh * self.cfg.glass.fade_start.clamp(0.5, 3.0) / body.h;
+                        // pure black down to the halfway mark ("Bottom fade start" moves it; 1.7 is half),
+                        // then the black thins out evenly toward the bottom edge: an almost straight ramp
+                        // with a soft start, so the colour comes in slowly and there is no visible line
+                        let from = 1.0 - self.cfg.glass.fade_start.clamp(0.5, 3.0) / 3.4;
                         let drop = self.cfg.glass.fade_amount.clamp(0.0, 1.0) * band_k * bd_k;
-                        let at = |t: f32| {
-                            let e = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-                            Color::black(bg_alpha * (1.0 - drop * e))
-                        };
                         let span = 1.0 - from;
-                        p.fill_geometry_vgrad(
-                            &g,
-                            body.y,
-                            body.bottom(),
-                            &[
-                                (0.0, Color::black(bg_alpha)),
-                                (from, Color::black(bg_alpha)),
-                                (from + span * 0.25, at(0.25)),
-                                (from + span * 0.5, at(0.5)),
-                                (from + span * 0.75, at(0.75)),
-                                (1.0, at(1.0)),
-                            ],
-                        );
+                        let mut stops = [(0.0_f32, Color::black(bg_alpha)); 8];
+                        stops[1] = (from, Color::black(bg_alpha));
+                        for (i, st) in stops.iter_mut().enumerate().skip(2) {
+                            let t = (i - 1) as f32 / 6.0;
+                            let e = 0.6 * t * t * (3.0 - 2.0 * t) + 0.4 * t;
+                            *st = (from + span * t, Color::black(bg_alpha * (1.0 - drop * e)));
+                        }
+                        p.fill_geometry_vgrad(&g, body.y, body.bottom(), &stops);
                     } else {
                         p.fill_geometry(&g, Color::black(bg_alpha));
                     }
@@ -3577,20 +4037,33 @@ impl App {
 
                 // compact live activity / idle indicators
                 if a_compact > 0.003 || self.mode == Mode::Idle {
-                    ui.p.alpha = if self.activity.is_some() { a_compact } else { 1.0 - a_peek.max(a_exp) };
-                    let acts = if split_on { None } else { self.activity.as_ref() };
-                    draw_compact(&mut ui, body, acts, &self.indicators, ap.notch_height, &mut bars);
+                    ui.p.alpha = match vact {
+                        Some(l) => l.alpha,
+                        None if self.activity.is_some() => a_compact,
+                        None => 1.0 - if vexp.is_some() { 1.0 } else { a_peek.max(a_exp) },
+                    };
+                    match &self.snap_act {
+                        // coming in: the soft picture (see `prepare_small`)
+                        Some(pic) if vact.is_some() => {
+                            bars = self.small_bars;
+                            ui.p.snapshot_blurred(pic, 0.0, 0.0, 1.0);
+                        }
+                        _ => {
+                            let acts = if split_on { None } else { self.activity.as_ref() };
+                            draw_compact(&mut ui, body, acts, &self.indicators, ap.notch_height, &mut bars);
+                        }
+                    }
                     if self.activity.is_none() && !glances.is_empty() {
                         draw_idle_widgets(&mut ui, body, &glances, ap.notch_height);
                     }
                 }
                 // peek banner
-                if a_peek > 0.003 {
-                    if let Some(pk) = &self.peek {
-                        ui.p.alpha = a_peek;
-                        let s = 0.92 + 0.08 * a_peek;
+                if a_peek > 0.003 || vpeek.is_some() {
+                    if let Some(pk) = self.peek.as_ref().or(self.peek_out.as_ref()) {
+                        ui.p.alpha = vpeek.map_or(a_peek, |l| l.alpha);
+                        let s = if vpeek.is_some() { 1.0 } else { 0.92 + 0.08 * a_peek };
                         ui.p.set_local(s, body.cx(), 0.0, 0.0, 0.0);
-                        ui.interactive = a_peek > 0.9;
+                        ui.interactive = a_peek > 0.9 && vpeek.is_none();
                         let left = pk.until.saturating_duration_since(now).as_secs_f32()
                             / pk.peek.duration.as_secs_f32().max(0.1);
                         let swap = pk.swap.as_ref().and_then(|(at, old)| {
@@ -3605,7 +4078,10 @@ impl App {
                         if let Some(b) = band {
                             ui.p.push_clip(Rect::new(0.0, -200.0, self.win_w, b.rect.y + 200.0));
                         }
-                        draw_peek(&mut ui, body, &pk.peek, left.clamp(0.0, 1.0), swap);
+                        match &self.snap_peek {
+                            Some(pic) if vpeek.is_some() && swap.is_none() => ui.p.snapshot_blurred(pic, 0.0, 0.0, 1.0),
+                            _ => draw_peek(&mut ui, body, &pk.peek, left.clamp(0.0, 1.0), swap),
+                        }
                         if let Some(b) = band {
                             ui.p.pop_clip();
                             band_draw(&mut ui, b, body, a_r, a_ear);
@@ -3614,11 +4090,11 @@ impl App {
                     }
                 }
                 // expanded
-                if a_exp > 0.003 {
-                    ui.p.alpha = a_exp;
-                    let s = 0.94 + 0.06 * a_exp;
+                if a_exp > 0.003 || vexp.is_some() {
+                    ui.p.alpha = vexp.map_or(a_exp, |l| l.alpha);
+                    let s = if vexp.is_some() { 1.0 } else { 0.94 + 0.06 * a_exp };
                     ui.p.set_local(s, body.cx(), 0.0, 0.0, 0.0);
-                    ui.interactive = a_exp > 0.85 && self.mode == Mode::Expanded;
+                    ui.interactive = a_exp > 0.85 && self.mode == Mode::Expanded && vexp.is_none();
                     let tw = page_w;
                     let full = Rect::new(
                         body.cx() - tw * 0.5,
@@ -3632,11 +4108,17 @@ impl App {
                         // opening or closing: the finished picture is only faded and scaled
                         Some(snap) => {
                             ui.interactive = false;
-                            ui.p.snapshot(snap, 0.0, 0.0, 1.0);
+                            if vexp.is_some() {
+                                ui.p.snapshot_blurred(snap, 0.0, 0.0, 1.0);
+                            } else {
+                                ui.p.snapshot(snap, 0.0, 0.0, 1.0);
+                            }
                         }
                         None => {
                             let trans =
-                                self.page_from.map(|(from, dir)| (from, dir, self.anim.page.value.clamp(0.0, 1.0)));
+                                self.page_from.map(|(from, dir)| {
+                                    (from, dir, if veils { page_e } else { self.anim.page.value.clamp(0.0, 1.0) })
+                                });
                             let pages = self.snap_pages.as_ref().map(|(a, b)| (a, b));
                             // the strip along the bottom is drawn from its own picture (sharp, then
                             // softer toward the rim), so the live page stops just above it
@@ -3762,8 +4244,38 @@ impl App {
         cfg
     }
 
+    /// The Alcove look with `[launcher] alcove` on: a launcher hotkey opens the launcher inside the notch (the
+    /// same hotkey again puts it away). False when Tuna's launcher should answer instead.
+    fn alcove_launch(&mut self, what: &str) -> bool {
+        if !crate::ui::look_alcove() || !self.cfg.launcher.alcove {
+            return false;
+        }
+        let Some(i) = self.module_index(modules::alcove_launcher::ID) else { return false };
+        if !self.started[i] {
+            return false;
+        }
+        let showing = self.mode == Mode::Expanded && self.page == modules::alcove_launcher::ID;
+        let mut fx = Effects::default();
+        {
+            let mut cx =
+                Cx { bus: &self.bus, cfg: &self.cfg, fx: &mut fx, hwnd: SendHwnd::new(self.hwnd), now: Instant::now() };
+            let ev = SystemEvent::Command {
+                verb: "alcove-launcher".into(),
+                args: vec![what.into(), if showing { "open".into() } else { "closed".into() }],
+            };
+            self.modules[i].on_system(&ev, &mut cx);
+        }
+        self.user_hidden = false;
+        self.apply_effects(fx);
+        self.schedule_wake();
+        true
+    }
+
     /// The Gemini hotkey: the launcher as a one-question chat, or put it away again.
     fn launcher_ai_toggle(&mut self) {
+        if self.alcove_launch("ai") {
+            return;
+        }
         if self.launcher.is_none() {
             match crate::launcher::Launcher::new(&self.gfx, self.host.compositor.clone()) {
                 Ok(l) => self.launcher = Some(l),
@@ -3798,6 +4310,9 @@ impl App {
 
     /// The switcher hotkey (Alt+Tab): the launcher as a row of the open windows; pressed again it steps on.
     fn launcher_switch(&mut self, back: bool) {
+        if self.alcove_launch(if back { "switch-back" } else { "switch" }) {
+            return;
+        }
         let Some(scale) = self.launcher_ready() else { return };
         if let Some(l) = self.launcher.as_mut() {
             l.windows_step(&self.gfx, scale, back);
@@ -3806,6 +4321,9 @@ impl App {
 
     /// The Run hotkey (Win+R): the launcher as one Run box, or put it away again.
     fn launcher_run_toggle(&mut self) {
+        if self.alcove_launch("run") {
+            return;
+        }
         let Some(scale) = self.launcher_ready() else { return };
         if let Some(l) = self.launcher.as_mut() {
             l.toggle_run(&self.gfx, scale);
@@ -3814,6 +4332,9 @@ impl App {
 
     /// The clipboard hotkey: the launcher as a history of what was copied, or put it away again.
     fn launcher_clip_toggle(&mut self) {
+        if self.alcove_launch("clip") {
+            return;
+        }
         if self.launcher.is_none() {
             match crate::launcher::Launcher::new(&self.gfx, self.host.compositor.clone()) {
                 Ok(l) => self.launcher = Some(l),
@@ -3851,6 +4372,9 @@ impl App {
 
     /// The launcher hotkey: open the launcher, or put it away again.
     fn launcher_toggle(&mut self) {
+        if self.alcove_launch("search") {
+            return;
+        }
         if self.launcher.is_none() {
             match crate::launcher::Launcher::new(&self.gfx, self.host.compositor.clone()) {
                 Ok(l) => self.launcher = Some(l),
@@ -4202,6 +4726,21 @@ thread_local! {
 }
 const HUD_DWELL_SECS: f32 = 0.7;
 
+thread_local! {
+    /// Where the volume peek shows its value: a click there opens the volume mixer.
+    static HUD_TEXT: std::cell::Cell<Option<Rect>> = const { std::cell::Cell::new(None) };
+}
+
+/// Remember where the volume text of the peek is (and show the pointer over it), so a click on it can open the mixer.
+fn hud_text_zone(ui: &mut Ui, pk: &Peek, zone: Rect) {
+    if pk.key == Some("osd-volume") {
+        HUD_TEXT.with(|z| z.set(Some(zone)));
+        if ui.hovered(zone) {
+            ui.hot = true;
+        }
+    }
+}
+
 /// The sweep of a dial's ring for a level (0..1): clockwise or counter-clockwise by the setting.
 fn dial_sweep(cfg: &Config, level: f32) -> f32 {
     let sweep = std::f32::consts::TAU * level;
@@ -4263,9 +4802,27 @@ fn draw_device_dial(ui: &mut Ui, body: Rect, pk: &Peek) {
     ui.p.text(&name, r, &st);
 }
 
+/// "45%" or "45" → ("45", "%") / ("45", ""), when the text is only a number.
+fn number_parts(s: &str) -> Option<(&str, &str)> {
+    let digits = s.strip_suffix('%').unwrap_or(s);
+    let suffix = &s[digits.len()..];
+    (!digits.is_empty() && digits.len() <= 4 && digits.bytes().all(|b| b.is_ascii_digit())).then_some((digits, suffix))
+}
+
+/// Which rolling number a volume, brightness or battery readout is (so each keeps its own).
+fn roll_key(pk: &Peek) -> u64 {
+    let slot = match pk.key {
+        Some("osd-volume") => 0,
+        Some("osd-brightness") => 1,
+        Some("battery") => 2,
+        _ => 3,
+    };
+    gkey("hud-number", slot)
+}
+
 fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: Option<&str>) {
     let pad = 24.0;
-    let row_y = body.bottom() - 36.0 - band_room(ui.cfg);
+    let row_y = if crate::ui::look_alcove() { body.cy() - 12.0 } else { body.bottom() - 36.0 - band_room(ui.cfg) };
     // Alcove: one big round dial instead of the slider (setting: General, round dial)
     let dial = dial_height(pk, ui.cfg).is_some();
     let dial_cy = body.y + ui.cfg.appearance.notch_height + 66.0;
@@ -4318,7 +4875,7 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
     if dial {
         let fill = if color.a < 0.9 {
             Color::white(0.38)
-        } else if color == palette::GREEN || color == palette::RED || color == palette::ORANGE {
+        } else if color == palette::RED {
             color
         } else {
             Color::white(0.97)
@@ -4338,6 +4895,7 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
         // the value sits inside the ring, clear of the soft blur along the bottom edge
         let pct = format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0);
         let r = Rect::new(body.cx() - 38.0, dial_cy + 3.0, 76.0, 22.0);
+        hud_text_zone(ui, pk, Rect::new(body.cx() - 40.0, dial_cy + 8.0, 80.0, 24.0));
         if hint {
             ui.p.text("Switch output", r, &TextStyle::new(10.5, palette::TEXT_DIM).medium().center());
             return;
@@ -4351,39 +4909,58 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
         // a long name (a Bluetooth device) is set smaller and cut short to stay inside the ring
         let size = if big.chars().count() <= 5 { 17.0 } else { 12.0 };
         let st = TextStyle::new(size, Color::white(0.95)).semibold().display().center();
-        let big = fit_text(ui, big, &st, r.w);
-        ui.p.text(&big, r, &st);
+        if let Some((digits, suffix)) = number_parts(&big) {
+            ui.roll_number(r, roll_key(pk), digits, suffix, &st);
+        } else {
+            let big = fit_text(ui, big, &st, r.w);
+            ui.p.text(&big, r, &st);
+        }
         return;
     }
     if crate::ui::look_alcove() {
         // a round, quiet pill: the icon, then one thick capsule that fills with the level
         let fill = if color.a < 0.9 {
             Color::white(0.38)
-        } else if color == palette::GREEN || color == palette::RED || color == palette::ORANGE {
+        } else if color == palette::RED {
             color
         } else {
             Color::white(0.97)
         };
-        ui.p.icon(pk.icon, ir, fill.lerp(Color::white(1.0), 0.2));
+        // laid out on a fixed-width frame, so it never squeezes while the notch is still widening
+        let cw = 350.0_f32.min(ui.cfg.appearance.expanded_width);
+        let frame = Rect::centered(body.cx(), body.cy(), cw, body.h);
+        let a0 = ui.p.alpha;
+        ui.p.alpha = a0 * smoothstep(0.75, 1.0, body.w / cw);
+        ui.p.push_clip(body);
+        let ir = Rect::new(frame.x + pad, body.cy() - 12.0, 24.0, 24.0);
         let level = ui.glide(gkey("alcove-hud", 0), frac.clamp(0.0, 1.0));
-        let bx = ir.right() + 16.0;
-        if hint {
-            ui.p.text("Switch output", Rect::new(bx, ir.y, 140.0, ir.h), &TextStyle::new(12.5, palette::TEXT_DIM));
+        // the name of the thing at the left; the bar and its number at the right
+        let label = if hint {
+            "Switch output"
         } else {
-            let tw = match text {
-                Some(t) => ui.p.measure(t, &TextStyle::new(13.0, Color::white(0.85)).medium()).0 + 14.0,
-                None => 0.0,
-            };
-            let bar = Rect::new(bx, ir.cy() - 6.5, (body.right() - pad - tw - bx).max(30.0), 13.0);
-            crate::alcove::meter(ui, bar, level, fill);
-            if let Some(t) = text {
-                ui.p.text(
-                    t,
-                    Rect::new(bar.right() + 10.0, ir.y, tw, ir.h),
-                    &TextStyle::new(13.0, Color::white(0.85)).medium().right(),
-                );
+            match pk.key {
+                Some("osd-volume") => "Volume",
+                Some("osd-brightness") => "Brightness",
+                _ => text.map(|t| t.split(" \u{b7} ").next().unwrap_or(t)).unwrap_or("Battery"),
             }
+        };
+        let ls = TextStyle::new(13.5, Color::white(0.7)).semibold();
+        ui.p.text(label, Rect::new(frame.x + pad, ir.y, 120.0, ir.h), &ls);
+        let num = format!("{:.0}", frac.clamp(0.0, 1.0) * 100.0);
+        let ns = TextStyle::new(13.0, Color::white(0.92)).medium().display().right();
+        let nw = 30.0;
+        let nx = frame.right() - pad - nw;
+        let bar = Rect::new(nx - 10.0 - 120.0, ir.cy() - 3.0, 120.0, 6.0);
+        let rr = bar.h * 0.36;
+        ui.p.fill_rounded(bar, rr, Color::white(0.14));
+        let lv = level.clamp(0.0, 1.0);
+        if lv > 0.0 {
+            ui.p.fill_rounded(Rect::new(bar.x, bar.y, (bar.w * lv).max(bar.h), bar.h), rr, fill);
         }
+        ui.roll_number(Rect::new(nx, ir.y, nw, ir.h), roll_key(pk), &num, "", &ns);
+        hud_text_zone(ui, pk, Rect::new(bar.x - 8.0, ir.y - 4.0, bar.w + nw + 26.0, ir.h + 8.0));
+        ui.p.pop_clip();
+        ui.p.alpha = a0;
         return;
     }
     ui.p.icon(pk.icon, ir, color);
@@ -4391,7 +4968,13 @@ fn draw_hud(ui: &mut Ui, body: Rect, pk: &Peek, frac: f32, color: Color, text: O
     let value = text.map(str::to_string).unwrap_or_else(|| format!("{:.0}", frac * 100.0));
     let vs = TextStyle::new(13.0, Color::white(0.80)).medium().display().right();
     let vw = 46.0;
-    ui.p.text(&value, Rect::new(body.right() - pad - vw, ir.y, vw, ir.h), &vs);
+    let value_rect = Rect::new(body.right() - pad - vw, ir.y, vw, ir.h);
+    if let Some((digits, suffix)) = number_parts(&value) {
+        ui.roll_number(value_rect, roll_key(pk), digits, suffix, &vs);
+    } else {
+        ui.p.text(&value, value_rect, &vs);
+    }
+    hud_text_zone(ui, pk, Rect::new(body.right() - pad - vw - 6.0, ir.y - 4.0, vw + 12.0, ir.h + 8.0));
     let bx = if hint { ir.right() + 14.0 } else { ir.right() + 16.0 };
     if hint {
         ui.p.text("Switch output", Rect::new(bx, ir.y, 110.0, ir.h), &TextStyle::new(11.5, palette::TEXT_DIM));
@@ -4415,55 +4998,236 @@ const SCAN_HELLO_AT: f32 = 0.46;
 
 /// The unlock greeting in the Alcove look: a big open padlock in the middle of the same thick ring
 /// the volume dial uses. The ring fills, the lock opens, then "Hello" and the name come in below.
-fn draw_scan_alcove(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
+fn draw_scan_alcove(ui: &mut Ui, body: Rect, _pk: &Peek, t: f32) {
+    // closed lock + green scan mark, a soft swap, open lock + green check (no spinning)
     let alpha = ui.p.alpha;
-    // the ring starts in the middle and slides to the left as "Hello" arrives
-    let cx = lerp(body.cx(), body.x + 82.0, smoothstep(0.44, 0.64, t));
-    let cy = body.y + ui.cfg.appearance.notch_height + 66.0;
-    let pop = smoothstep(0.0, 0.12, t);
-    let fade = 1.0 - smoothstep(0.90, 1.0, t);
-    let fill = smoothstep(0.06, 0.42, t);
-    let done = smoothstep(0.40, 0.48, t);
+    let cw = 260.0_f32.min(ui.cfg.appearance.expanded_width);
+    let frame = Rect::centered(body.cx(), body.cy(), cw, body.h);
+    let show = smoothstep(0.75, 1.0, body.w / cw) * (1.0 - smoothstep(0.90, 1.0, t));
+    let out = smoothstep(0.26, 0.38, t);
+    let inn = smoothstep(0.40, 0.54, t);
+    let cy = body.cy();
+    let (lx, rx) = (frame.x + 15.0, frame.right() - 15.0);
 
-    // the ring: a faint track and a thick arc with round ends, in the direction chosen in Settings
-    let r = 46.0 * (0.9 + 0.1 * pop);
-    ui.p.alpha = alpha * pop * fade;
-    ui.p.stroke_circle(cx, cy, r, 12.0, Color::white(0.12));
-    ui.p.arc(cx, cy, r, 0.0, dial_sweep(ui.cfg, fill), 12.0, Color::white(0.97));
-
-    // the closed lock gives way to the open one
-    ui.p.alpha = alpha * pop * fade * (1.0 - done);
-    ui.p.icon(Icon::Lock, Rect::centered(cx, cy, 40.0, 40.0), Color::white(0.97));
-    let k = 0.75 + 0.25 * done;
-    ui.p.alpha = alpha * fade * done;
-    ui.p.icon(Icon::Unlock, Rect::centered(cx, cy, 44.0 * k, 44.0 * k), Color::white(1.0));
-
-    // "Hello" first, the name a beat later, to the right of the ring
-    let hello = smoothstep(0.50, 0.62, t);
-    let x0 = body.x + 152.0;
-    let tw = (body.right() - x0 - 22.0).max(40.0);
-    let name = hello_name(&pk.title);
-    let hy = if name.is_empty() { cy - 17.0 } else { cy - 38.0 };
-    ui.p.alpha = alpha * hello * fade;
-    ui.p.text(
-        "Hello",
-        Rect::new(x0 - 10.0 * (1.0 - hello), hy, tw, 34.0),
-        &TextStyle::new(28.0, Color::white(0.97)).semibold().display(),
-    );
-    if !name.is_empty() {
-        let nm = smoothstep(0.62, 0.74, t);
-        ui.p.alpha = alpha * nm * fade;
-        let mut size = 20.0;
-        let (nw, _) = ui.p.measure(name, &TextStyle::new(size, Color::white(1.0)).semibold());
-        size *= (tw / nw.max(1.0)).min(1.0);
-        ui.p.text(
-            name,
-            Rect::new(x0 - 10.0 * (1.0 - nm), cy + 2.0, tw, 28.0),
-            &TextStyle::new(size, Color::white(0.62)).semibold(),
-        );
+    ui.p.push_clip(body);
+    // the padlock itself stays; only its shackle spins and swings out
+    ui.p.alpha = alpha * show;
+    lock_swing(ui, lx, cy, smoothstep(0.28, 0.64, t));
+    // before
+    ui.p.alpha = alpha * show * (1.0 - out);
+    if out < 0.999 {
+        face_id(ui, rx, cy, 1.0 - 0.12 * out);
     }
+    // after
+    ui.p.alpha = alpha * show * inn;
+    if inn > 0.001 {
+        let k = 0.88 + 0.12 * inn;
+        ui.p.fill_circle(rx, cy, 8.0 * k, palette::GREEN);
+        ui.p.icon(Icon::Check, Rect::centered(rx, cy, 11.0 * k, 11.0 * k), Color::black(0.85));
+        let ws = TextStyle::new(13.5, Color::white(0.85)).semibold().right();
+        ui.p.text("Unlocked", Rect::new(rx - 8.0 - 12.0 - 100.0, cy - 10.0, 100.0, 20.0), &ws);
+    }
+    ui.p.pop_clip();
+
     ui.p.alpha = alpha;
-    if t < 0.95 {
+    if t < 0.6 {
+        ui.animate();
+    }
+}
+
+/// The padlock of the unlock animation, 16 px tall at scale 1: a light grey body and a thin
+/// shackle. Open, the shackle sits shifted to the right of the body, its right leg hanging free.
+fn lock_glyph(ui: &mut Ui, cx: f32, cy: f32, s: f32, open: bool) {
+    let c = Color::white(0.84);
+    ui.p.fill_rounded(Rect::new(cx - 5.5 * s, cy, 11.0 * s, 8.0 * s), 1.8 * s, c);
+    let w = 2.0 * s;
+    let hw = if open { 3.0 } else { 3.4 } * s;
+    let sx = if open { 7.5 * s } else { 0.0 };
+    let (xl, xr) = (cx - hw + sx, cx + hw + sx);
+    let ac = cy - 7.0 * s + hw;
+    ui.p.line(xl, cy + 0.5 * s, xl, ac, w, c);
+    ui.p.line(xr, cy + 0.5 * s, xr, ac, w, c);
+    let mut prev = (xl, ac);
+    for i in 1..=8 {
+        let a = std::f32::consts::PI * (1.0 - i as f32 / 8.0);
+        let to = (cx + sx + hw * a.cos(), ac - hw * a.sin());
+        ui.p.line(prev.0, prev.1, to.0, to.1, w, c);
+        prev = to;
+    }
+}
+
+/// The padlock with its shackle on the move, as on a real one: `k` 0..1 first pops the shackle up
+/// a little, then swivels it about its left leg (the one that stays in the body) until it hangs
+/// open to the left. Seen from the front, the arc squeezes to a line as it turns edge-on and
+/// then opens out again on the other side. The body stays put, in front of the shackle.
+fn lock_swing(ui: &mut Ui, cx: f32, cy: f32, k: f32) {
+    let c = Color::white(0.84);
+    let hw = 3.4;
+    let lift = 3.0 * smoothstep(0.0, 0.3, k);
+    let cp = (std::f32::consts::PI * 0.9 * smoothstep(0.25, 1.0, k)).cos();
+    let xl = cx - hw;
+    let ac = cy - 7.0 + hw - lift;
+    let foot = cy + 4.0 - lift;
+    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(11);
+    pts.push((xl, foot));
+    for i in 0..=8 {
+        let a = std::f32::consts::PI * (1.0 - i as f32 / 8.0);
+        pts.push((xl + (hw + hw * a.cos()) * cp, ac - hw * a.sin()));
+    }
+    pts.push((xl + 2.0 * hw * cp, foot));
+    for w in pts.windows(2) {
+        ui.p.line(w[0].0, w[0].1, w[1].0, w[1].1, 2.0, c);
+    }
+    ui.p.fill_rounded(Rect::new(cx - 5.5, cy, 11.0, 8.0), 1.8, c);
+}
+
+/// The green Face ID mark: four corner brackets round a small face.
+fn face_id(ui: &mut Ui, cx: f32, cy: f32, s: f32) {
+    let g = palette::GREEN;
+    let (h, arm, w) = (6.5 * s, 3.4 * s, 1.5 * s);
+    for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let (x, y) = (cx + sx * h, cy + sy * h);
+        ui.p.line(x, y, x - sx * arm, y, w, g);
+        ui.p.line(x, y, x, y - sy * arm, w, g);
+    }
+    ui.p.line(cx - 2.2 * s, cy - 2.2 * s, cx - 2.2 * s, cy - 0.6 * s, w * 0.9, g);
+    ui.p.line(cx + 2.2 * s, cy - 2.2 * s, cx + 2.2 * s, cy - 0.6 * s, w * 0.9, g);
+    let mut prev = (cx - 2.6 * s, cy + 2.2 * s);
+    for i in 1..=4 {
+        let x = -2.6 + 5.2 * i as f32 / 4.0;
+        let to = (cx + x * s, cy + (2.2 + 1.2 * (1.0 - (x / 2.6) * (x / 2.6))) * s);
+        ui.p.line(prev.0, prev.1, to.0, to.1, w * 0.9, g);
+        prev = to;
+    }
+}
+
+/// A Bluetooth device connecting or leaving, in the Alcove look: shown as the wide pill.
+fn bt_pill(p: &Peek) -> bool {
+    crate::ui::look_alcove() && p.key == Some("bluetooth") && !p.is_hud() && !p.scan
+}
+
+/// Caps lock and the other lock keys, the microphone, and USB drives (Alcove look): no bar,
+/// just the name at the left and the state at the right.
+fn status_pill(p: &Peek) -> bool {
+    crate::ui::look_alcove() && !p.scan && matches!(p.key, Some("locks" | "osd-mic" | "devices"))
+}
+
+fn draw_status_pill(ui: &mut Ui, body: Rect, pk: &Peek) {
+    let (label, value, on): (String, &str, bool) = match pk.key {
+        Some("locks") => {
+            let text = match &pk.trailing {
+                Trailing::Level { text: Some(t), .. } => t.as_str(),
+                _ => "",
+            };
+            let mut it = text.splitn(2, " \u{b7} ");
+            let l = it.next().unwrap_or("").to_string();
+            let on = it.next() == Some("On");
+            (l, if on { "On" } else { "Off" }, on)
+        }
+        Some("osd-mic") => {
+            let muted = pk.subtitle == "Muted";
+            ("Microphone".to_string(), if muted { "Muted" } else { "Unmuted" }, !muted)
+        }
+        _ => {
+            let up = pk.title == "Drive connected";
+            let d = pk.subtitle.trim_end_matches('\\');
+            let l = if d.is_empty() { "USB drive".to_string() } else { format!("USB drive {d}") };
+            (l, if up { "Connected" } else { "Disconnected" }, up)
+        }
+    };
+    let cw = 300.0_f32.min(ui.cfg.appearance.expanded_width);
+    let frame = Rect::centered(body.cx(), body.cy(), cw, body.h);
+    let a0 = ui.p.alpha;
+    ui.p.alpha = a0 * smoothstep(0.75, 1.0, body.w / cw);
+    ui.p.push_clip(body);
+    let r = Rect::new(frame.x + 24.0, body.cy() - 12.0, cw - 48.0, 24.0);
+    ui.p.text(&label, r, &TextStyle::new(13.5, Color::white(0.7)).semibold());
+    let vc = if on { Color::white(0.95) } else { Color::white(0.55) };
+    ui.p.text(value, r, &TextStyle::new(13.5, vc).semibold().right());
+    ui.p.pop_clip();
+    ui.p.alpha = a0;
+}
+
+/// A pair of earbuds seen from the front that turns about its vertical axis: both buds orbit
+/// the axis (the nearer one is drawn last) and each carries its stem and its nozzle round with it.
+fn airpods(ui: &mut Ui, cx: f32, cy: f32, turn: f32, k: f32) {
+    let (sn, cs) = turn.sin_cos();
+    let (d, n) = (4.2f32, 3.2f32);
+    let mut order = [(-1.0f32, sn * d), (1.0, -sn * d)];
+    if order[0].1 > order[1].1 {
+        order.swap(0, 1);
+    }
+    for (sx, z) in order {
+        let zn = ((z / d) + 1.0) * 0.5;
+        let c = Color::white(k * (0.70 + 0.28 * zn));
+        let x = cx + sx * d * cs;
+        let (hy, hr) = (cy - 1.8, 3.6);
+        // the nozzle faces the other bud; once the pair has turned it can be hidden behind the head
+        let nz = sx * n * sn;
+        let nozzle = |ui: &mut Ui| ui.p.fill_circle(x - sx * n * cs, cy - 1.2, 1.9, Color::white(k * (0.60 + 0.2 * zn)));
+        if nz < 0.0 {
+            nozzle(ui);
+        }
+        let sxs = x + sx * 1.4 * cs;
+        ui.p.fill_rounded(Rect::new(sxs - 1.3, hy, 2.6, 7.3), 1.3, c);
+        ui.p.fill_circle(x, hy, hr, c);
+        if nz >= 0.0 {
+            nozzle(ui);
+        }
+    }
+}
+
+/// Earbuds (or the device's icon) at the left, a mint battery ring at the right, no text.
+/// `t` runs 0..1 over the peek.
+fn draw_bt_pill(ui: &mut Ui, body: Rect, pk: &Peek, t: f32) {
+    let alpha = ui.p.alpha;
+    let gone = pk.subtitle == "Disconnected";
+    let cw = (ui.cfg.appearance.notch_width + 40.0).max(220.0).min(ui.cfg.appearance.expanded_width);
+    let frame = Rect::centered(body.cx(), body.cy(), cw, body.h);
+    let show = smoothstep(0.75, 1.0, body.w / cw) * (1.0 - smoothstep(0.90, 1.0, t));
+    let pop = smoothstep(0.0, 0.2, t);
+    let cy = body.cy();
+    let cx = frame.x + 20.0;
+    let lower = pk.title.to_lowercase();
+    let buds = matches!(pk.icon, Icon::Headphones)
+        || ["airpods", "pods", "buds", "earbud", "earphone"].iter().any(|k| lower.contains(k));
+
+    ui.p.push_clip(body);
+    ui.p.alpha = alpha * show;
+    if buds && gone {
+        // spinning while they fall: slow at first, then faster, out through the bottom edge
+        let v = ((t - 0.28) / 0.5).clamp(0.0, 1.0);
+        let turn = std::f32::consts::TAU * 0.9 * smoothstep(0.0, 0.8, t);
+        airpods(ui, cx, cy + 30.0 * v * v, turn, 1.0);
+    } else if buds {
+        let turn = std::f32::consts::PI * smoothstep(0.12, 0.62, t);
+        airpods(ui, cx, cy, turn, 1.0);
+    } else {
+        let k = 0.85 + 0.15 * pop;
+        let tone = if gone { Color::white(0.45) } else { Color::white(0.97) };
+        ui.p.icon(pk.icon, Rect::centered(cx, cy, 20.0 * k, 20.0 * k), tone);
+    }
+    if gone && !buds {
+        ui.p.line(cx - 8.0, cy + 7.0, cx + 8.0, cy - 7.0, 1.8, Color::white(0.7));
+    }
+
+    // the battery ring, filling as it appears (a full ring when the device reports no level)
+    let rx = frame.right() - 20.0;
+    let appear = smoothstep(0.08, 0.40, t);
+    let mint = Color::hex(0x7BF3A6);
+    ui.p.alpha = alpha * show * appear;
+    ui.p.stroke_circle(rx, cy, 6.2, 2.2, mint.with_a(0.22));
+    if !gone {
+        let lv = match &pk.trailing {
+            Trailing::Battery { level, .. } => ui.glide(gkey("bt-ring", 0), level.clamp(0.0, 1.0)),
+            _ => 1.0,
+        };
+        ui.p.arc(rx, cy, 6.2, 0.0, dial_sweep(ui.cfg, (lv * appear).min(0.999)), 2.2, mint);
+    }
+    ui.p.pop_clip();
+
+    ui.p.alpha = alpha;
+    if t < 0.9 {
         ui.animate();
     }
 }
@@ -4824,6 +5588,14 @@ fn draw_peek(ui: &mut Ui, body: Rect, pk: &Peek, left: f32, swap: Option<(f32, &
         draw_scan(ui, body, pk, 1.0 - left);
         return;
     }
+    if status_pill(pk) {
+        draw_status_pill(ui, body, pk);
+        return;
+    }
+    if bt_pill(pk) {
+        draw_bt_pill(ui, body, pk, 1.0 - left);
+        return;
+    }
     if let Trailing::Level { frac, color, text } = &pk.trailing {
         draw_hud(ui, body, pk, *frac, *color, text.as_deref());
         return;
@@ -4961,12 +5733,13 @@ fn draw_expanded(
     }
     crate::ui::reset_wheel_taken();
     draw_expanded_core(ui, full, modules, started, tabs, page, trans, indicators, snaps);
-    if crate::ui::look_alcove() {
+    if crate::ui::look_alcove() && page != modules::alcove_launcher::ID && page != modules::mixer::ID {
         crate::alcove::rail(ui, view, tabs, page);
     }
 
     // anywhere on the notch: a swipe sideways, or the wheel where nothing scrolls, turns the page
-    if tabs.is_empty() || !ui.hovered(full) {
+    // (the launcher page has no neighbours: it is only opened by its hotkeys)
+    if tabs.is_empty() || page == modules::alcove_launcher::ID || page == modules::mixer::ID || !ui.hovered(full) {
         return;
     }
     let (h, v) = (ui.input.hwheel, ui.input.wheel);
@@ -5134,10 +5907,13 @@ fn draw_expanded_core(
         full.w - side_pad() - right_pad(),
         full.h - top_h() - bottom_pad(),
     );
-    let Some((from, dir, t)) = trans else {
+    let Some((from, dir, t_in)) = trans else {
         draw_body(ui, content, modules, started, page);
         return;
     };
+    // (Alcove with the soft pictures: `t_in` is seconds since the switch; otherwise the spring's 0..1)
+    let measured = crate::ui::look_alcove() && ui.cfg.appearance.motion_cache;
+    let t = if measured { (t_in / (PAGE_SECS * ui.cfg.appearance.page_time)).clamp(0.0, 1.0) } else { t_in };
     // the page that is leaving keeps its own width and height
     let from_size = page_size(ui.cfg, modules, started, from);
     let from_content = page_content(full.cx(), full.y, from_size);
@@ -5149,6 +5925,43 @@ fn draw_expanded_core(
     let wide = full.w.max(from_size.0);
     let clip = Rect::new(full.cx() - wide * 0.5, content.y - 4.0, wide, content.h.max(from_content.h) + 8.0);
     ui.p.push_clip(clip);
+    // Alcove: both pages blur and fade where they stand, timed from a reference recording
+    if let (true, Some((old, new))) = (measured, snaps) {
+        let (old_l, new_l) = page_layers(t_in, ui.cfg.appearance.page_time);
+        if let Some(l) = old_l {
+            ui.p.alpha = base * l.alpha;
+            ui.interactive = false;
+            ui.p.snapshot_blurred(old, 0.0, 0.0, 1.0);
+        }
+        ui.p.alpha = base * new_l.alpha;
+        ui.interactive = false;
+        ui.p.snapshot_blurred(new, 0.0, 0.0, 1.0);
+        ui.p.alpha = base;
+        ui.interactive = was_interactive && t_in > 0.27 * PAGE_T * ui.cfg.appearance.page_time;
+        ui.p.pop_clip();
+        return;
+    }
+    // Setting "Blur between pages": the old page blurs out where it is, the new one blurs in
+    if let (true, Some((old, new))) = (ui.cfg.appearance.page_blur, snaps) {
+        if t < 0.55 {
+            let u = t / 0.55;
+            ui.p.alpha = base * (1.0 - smoothstep(0.45, 1.0, u));
+            ui.interactive = false;
+            let b = smoothstep(0.0, 0.75, u);
+            snapshot_motion(ui, old, 0.0, 0.0, b);
+        }
+        if t >= 0.36 {
+            let u = (t - 0.36) / 0.64;
+            ui.p.alpha = base * smoothstep(0.0, 0.4, u);
+            ui.interactive = was_interactive && u > 0.75;
+            let b = 1.0 - smoothstep(0.0, 0.85, u);
+            snapshot_motion(ui, new, 0.0, 0.0, b);
+        }
+        ui.p.alpha = base;
+        ui.interactive = was_interactive;
+        ui.p.pop_clip();
+        return;
+    }
     // Alcove: the pages move the way the wheel does (up and down) and smear along that
     // direction while they move, like a quick scroll
     let al = crate::ui::look_alcove();

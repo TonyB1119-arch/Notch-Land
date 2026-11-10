@@ -12,6 +12,8 @@
 //! Adding a module = implement `Module`, add it to `all()` below.
 
 pub mod ai;
+pub mod alcove_launcher;
+pub mod mixer;
 pub mod battery;
 pub mod bluetooth;
 pub mod calendar;
@@ -409,6 +411,8 @@ pub fn all() -> Vec<Box<dyn Module>> {
         Box::new(ports::Ports::new()),
         Box::new(ai::Ai::new()),
         Box::new(gemini::Gemini::new()),
+        Box::new(alcove_launcher::AlcoveLauncher::new()),
+        Box::new(mixer::Mixer::new()),
         Box::new(weather::Weather::new()),
         Box::new(control::ControlCenter::new()),
         Box::new(mirror::Mirror::new()),

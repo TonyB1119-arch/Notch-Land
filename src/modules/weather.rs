@@ -74,6 +74,15 @@ struct Day {
     rain: Option<f32>,
 }
 
+/// One hour of the forecast.
+#[derive(Clone, Debug)]
+struct Hour {
+    hour: u32,
+    cond: Cond,
+    night: bool,
+    temp: f32,
+}
+
 #[derive(Clone, Debug)]
 struct Forecast {
     place: String,
@@ -84,6 +93,8 @@ struct Forecast {
     cond: Cond,
     night: bool,
     days: Vec<Day>,
+    /// The next eight hours, starting with the current one.
+    hours: Vec<Hour>,
     imperial: bool,
 }
 
@@ -318,7 +329,7 @@ impl Module for Weather {
 
     fn page_height(&self, _w: f32) -> f32 {
         if crate::ui::look_alcove() {
-            164.0
+            268.0
         } else {
             238.0
         }
@@ -446,67 +457,64 @@ impl Module for Weather {
 }
 
 impl Weather {
-    /// Alcove: the weather now on the left, the days as rounded tiles on the right.
+    /// Alcove: the place, the big temperature and the details on the left of the big icon, and the
+    /// next eight hours as a quiet row of columns underneath.
     fn draw_alcove(&mut self, ui: &mut Ui, r: Rect, d: &Forecast) {
-        // the left block is as wide as the temperature needs, so it is never cut short
-        let temp = format!("{:.0}°", d.temp);
-        let big = TextStyle::new(54.0, palette::TEXT).weight(700);
-        let (temp_w, _) = ui.p.measure(&temp, &big);
-        let left_w = (r.w * 0.34).min(250.0).max(68.0 + temp_w + 10.0).min(r.w * 0.45);
-        draw_condition(ui.p, d.cond, Rect::new(r.x, r.y + 4.0, 56.0, 56.0), d.night);
-        ui.p.text(&temp, Rect::new(r.x + 68.0, r.y - 2.0, left_w - 68.0, 64.0), &big);
+        let isz = 92.0;
+        draw_condition(ui.p, d.cond, Rect::new(r.x + 6.0, r.y + 34.0, isz, isz), d.night);
+        let tx = r.x + isz + 34.0;
+        let tw = (r.right() - tx).max(60.0);
+        ui.p.text(&d.place, Rect::new(tx, r.y, tw, 24.0), &TextStyle::new(18.0, palette::TEXT).semibold());
         ui.p.text(
-            d.cond.label(),
-            Rect::new(r.x, r.y + 68.0, left_w, 24.0),
-            &TextStyle::new(17.0, palette::TEXT).semibold(),
+            &format!("{:.0}°", d.temp),
+            Rect::new(tx, r.y + 22.0, tw, 66.0),
+            &TextStyle::new(58.0, palette::TEXT).weight(700),
         );
-        ui.p.text(
-            &format!("{} · Feels like {:.0}°", d.place, d.feels),
-            Rect::new(r.x, r.y + 92.0, left_w, 20.0),
-            &TextStyle::new(12.5, palette::TEXT_DIM),
-        );
-        let wind_unit = if d.imperial { "mph" } else { "km/h" };
-        let facts = [format!("Humidity {:.0}%", d.humidity), format!("Wind {:.0} {wind_unit}", d.wind)];
-        let mut fx = r.x;
-        for f in &facts {
-            let (w, _) = ui.p.measure(f, &TextStyle::new(12.0, palette::TEXT).medium());
-            let b = Rect::new(fx, r.y + 122.0, w + 22.0, 28.0);
-            if b.right() > r.x + left_w + 8.0 {
-                break;
-            }
-            ui.p.text(f, Rect::new(b.x + 11.0, b.y, w + 4.0, b.h), &TextStyle::new(12.0, palette::TEXT).medium());
-            fx = b.right() + 8.0;
+        ui.p.text(d.cond.label(), Rect::new(tx, r.y + 90.0, tw, 22.0), &TextStyle::new(17.0, palette::TEXT).semibold());
+        let mut y = r.y + 116.0;
+        if let Some(day) = d.days.first() {
+            ui.p.text(
+                &format!("H: {:.0}°  L: {:.0}°", day.hi, day.lo),
+                Rect::new(tx, y, tw, 18.0),
+                &TextStyle::new(12.5, palette::TEXT_DIM).medium(),
+            );
+            y += 19.0;
         }
-        // the days
-        let fc = Rect::new(r.x + left_w + 22.0, r.y, r.w - left_w - 22.0, r.h);
-        let n = d.days.len().max(1) as f32;
-        let gap = 10.0;
-        let tw = (fc.w - gap * (n - 1.0)) / n;
-        for (i, day) in d.days.iter().enumerate() {
-            let t = Rect::new(fc.x + i as f32 * (tw + gap), fc.y, tw, fc.h);
+        let wind_unit = if d.imperial { "mph" } else { "km/h" };
+        ui.p.text(
+            &format!("Feels: {:.0}°     Wind: {:.0} {wind_unit}", d.feels, d.wind),
+            Rect::new(tx, y, tw, 18.0),
+            &TextStyle::new(12.0, palette::TEXT_FAINT),
+        );
+
+        // the next hours
+        if d.hours.is_empty() {
+            return;
+        }
+        let top = r.y + 168.0;
+        ui.p.text(
+            "HOURLY FORECAST",
+            Rect::new(r.x + 2.0, top, 220.0, 14.0),
+            &TextStyle::new(11.0, palette::TEXT_FAINT).semibold(),
+        );
+        let h24 = crate::app::clock_parts().3.is_empty();
+        let cw = r.w / d.hours.len() as f32;
+        let y0 = top + 24.0;
+        for (i, hr) in d.hours.iter().enumerate() {
+            let c = Rect::new(r.x + i as f32 * cw, y0, cw, 76.0);
+            let label = if h24 {
+                format!("{:02}", hr.hour)
+            } else {
+                let h12 = if hr.hour % 12 == 0 { 12 } else { hr.hour % 12 };
+                format!("{h12}{}", if hr.hour >= 12 { "PM" } else { "AM" })
+            };
+            ui.p.text(&label, Rect::new(c.x, c.y, c.w, 16.0), &TextStyle::new(12.0, palette::TEXT_DIM).medium().center());
+            draw_condition(ui.p, hr.cond, Rect::centered(c.cx(), c.y + 36.0, 28.0, 28.0), hr.night);
             ui.p.text(
-                &day.label,
-                Rect::new(t.x, t.y + 12.0, t.w, 18.0),
-                &TextStyle::new(12.5, palette::TEXT_DIM).semibold().center(),
+                &format!("{:.0}°", hr.temp),
+                Rect::new(c.x, c.y + 54.0, c.w, 20.0),
+                &TextStyle::new(15.0, palette::TEXT).semibold().center(),
             );
-            draw_condition(ui.p, day.cond, Rect::centered(t.cx(), t.y + 54.0, 32.0, 32.0), false);
-            ui.p.text(
-                &format!("{:.0}°", day.hi),
-                Rect::new(t.x, t.y + 78.0, t.w, 22.0),
-                &TextStyle::new(16.0, palette::TEXT).semibold().center(),
-            );
-            ui.p.text(
-                &format!("{:.0}°", day.lo),
-                Rect::new(t.x, t.y + 100.0, t.w, 20.0),
-                &TextStyle::new(13.5, palette::TEXT_FAINT).medium().center(),
-            );
-            if let Some(p) = day.rain.filter(|p| *p >= 20.0) {
-                ui.p.text(
-                    &format!("{p:.0}%"),
-                    Rect::new(t.x, t.y + 128.0, t.w, 18.0),
-                    &TextStyle::new(11.5, palette::TEAL).semibold().center(),
-                );
-            }
         }
     }
 }
@@ -629,6 +637,7 @@ fn forecast(p: &Place, imperial: bool) -> Result<Forecast, String> {
         "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}\
          &current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day\
          &daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max\
+         &hourly=temperature_2m,weather_code,is_day\
          &timezone=auto&forecast_days=5&{units}",
         p.lat, p.lon
     );
@@ -656,6 +665,29 @@ fn forecast(p: &Place, imperial: bool) -> Result<Forecast, String> {
             rain: f(&rains),
         });
     }
+    // the next eight hours, starting with the current one (the times are local, "2026-11-08T17:00")
+    let hourly = |k: &str| v.pointer(&format!("/hourly/{k}")).and_then(Value::as_array).cloned().unwrap_or_default();
+    let (h_times, h_temps, h_codes, h_day) =
+        (hourly("time"), hourly("temperature_2m"), hourly("weather_code"), hourly("is_day"));
+    let now_hour = v.pointer("/current/time").and_then(Value::as_str).and_then(|t| t.get(..13)).unwrap_or("").to_string();
+    let mut hours = Vec::new();
+    for (i, t) in h_times.iter().enumerate() {
+        let t = t.as_str().unwrap_or("");
+        let Some(head) = t.get(..13) else { continue };
+        if head < now_hour.as_str() {
+            continue;
+        }
+        let Some(temp) = h_temps.get(i).and_then(Value::as_f64) else { continue };
+        hours.push(Hour {
+            hour: t.get(11..13).and_then(|x| x.parse().ok()).unwrap_or(0),
+            cond: Cond::from_code(h_codes.get(i).and_then(Value::as_u64).unwrap_or(3) as u32),
+            night: h_day.get(i).and_then(Value::as_f64).is_some_and(|x| x < 0.5),
+            temp: temp as f32,
+        });
+        if hours.len() == 8 {
+            break;
+        }
+    }
     Ok(Forecast {
         place: p.name.clone(),
         temp,
@@ -665,6 +697,7 @@ fn forecast(p: &Place, imperial: bool) -> Result<Forecast, String> {
         cond: Cond::from_code(cur("weather_code").unwrap_or(3.0) as u32),
         night: cur("is_day").is_some_and(|d| d < 0.5),
         days,
+        hours,
         imperial,
     })
 }

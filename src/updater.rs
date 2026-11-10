@@ -65,6 +65,11 @@ fn headers() -> [(&'static str, String); 2] {
     [("Accept", "application/vnd.github+json".to_string()), ("User-Agent", "DynamicNotch".to_string())]
 }
 
+/// Headers for downloading the program file itself.
+fn download_headers() -> [(&'static str, String); 2] {
+    [("Accept", "application/octet-stream".to_string()), ("User-Agent", "DynamicNotch".to_string())]
+}
+
 fn run_check(repo: &str) -> Msg {
     if repo.split('/').count() != 2 || repo.contains(' ') || repo.starts_with('/') || repo.ends_with('/') {
         return Msg::Failed("Set [update] repo in the config (owner/name)".into());
@@ -140,7 +145,7 @@ fn download(url: &str, path: &std::path::Path) -> Result<(), String> {
     let mut first = [0u8; 2];
     let mut write_ok = true;
     let result =
-        http::request("GET", url, &headers(), &[], Timeouts(10_000, 15_000, 30_000, 300_000), &cancel, |chunk| {
+        http::request("GET", url, &download_headers(), &[], Timeouts(10_000, 15_000, 30_000, 300_000), &cancel, |chunk| {
             if total == 0 && chunk.len() >= 2 {
                 first = [chunk[0], chunk[1]];
             }
@@ -154,7 +159,7 @@ fn download(url: &str, path: &std::path::Path) -> Result<(), String> {
         let _ = std::fs::remove_file(path);
         return Err(match result {
             Err(e) => e,
-            _ => "The download didn't look right".to_string(),
+            Ok(code) => format!("The download didn't look right (HTTP {code}, {total} bytes)"),
         });
     }
     Ok(())

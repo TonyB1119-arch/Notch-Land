@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::bus::Bus;
 use crate::config::Config;
-use crate::gfx::{Icon, ImageData, Painter, TextStyle};
+use crate::gfx::{Align, Icon, ImageData, Painter, TextStyle};
 use crate::modules::Effects;
 use crate::util::{palette, Color, Rect};
 
@@ -64,6 +64,8 @@ thread_local! {
     static GLIDE: RefCell<HashMap<u64, (f32, Instant)>> = RefCell::new(HashMap::new());
     /// Flip clock digits: slot → (digit shown, previous digit, when it changed, last drawn).
     static FLIP: RefCell<HashMap<u32, (u8, u8, Instant, Instant)>> = RefCell::new(HashMap::new());
+    /// Rolling numbers (see `Ui::roll_number`): key → (shown, previous, when it changed, last drawn).
+    static ROLL: RefCell<HashMap<u64, (String, String, Instant, Instant)>> = RefCell::new(HashMap::new());
     /// Presses that are glowing from within (see `Ui::glow`): a handful at most, empty when idle.
     static GLOWS: RefCell<Vec<Glow>> = const { RefCell::new(Vec::new()) };
 }
@@ -124,7 +126,7 @@ fn long_ago(now: Instant) -> Instant {
 const FLIP_SECS: f32 = 0.6;
 
 /// How long one rolling digit takes (seconds).
-const ROLL_SECS: f32 = 0.55;
+const ROLL_SECS: f32 = 0.34;
 
 const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
@@ -576,6 +578,76 @@ impl<'p, 'a> Ui<'p, 'a> {
                 self.p.pop_local(saved);
                 self.p.pop_clip();
             }
+        }
+    }
+
+    /// A number whose digits roll like a reel when it changes: the old digit slides out and fades while
+    /// the new one slides in (upwards when the number grew, downwards when it shrank). Only the digits
+    /// that changed roll. `suffix` (a "%") stays put after the digits. `key` identifies the number
+    /// between frames and `style.align` says where in `r` it sits.
+    pub fn roll_number(&mut self, r: Rect, key: u64, digits: &str, suffix: &str, style: &TextStyle) {
+        let now = self.now;
+        let (cur, prev, t) = ROLL.with(|m| {
+            let mut m = m.borrow_mut();
+            let e = m.entry(key).or_insert_with(|| (digits.to_string(), digits.to_string(), long_ago(now), now));
+            // coming back after a while: no roll for a stale number
+            if now.saturating_duration_since(e.3).as_secs_f32() > 2.0 {
+                *e = (digits.to_string(), digits.to_string(), long_ago(now), now);
+            }
+            if e.0 != digits {
+                e.1 = std::mem::replace(&mut e.0, digits.to_string());
+                e.2 = now;
+            }
+            e.3 = now;
+            (e.0.clone(), e.1.clone(), now.saturating_duration_since(e.2).as_secs_f32() / ROLL_SECS)
+        });
+        let rolling = t < 1.0 && prev != cur;
+        let dw = self.p.measure("0", style).0;
+        let sw = if suffix.is_empty() { 0.0 } else { self.p.measure(suffix, style).0 };
+        let new: Vec<char> = cur.chars().collect();
+        let old: Vec<char> = if rolling { prev.chars().collect() } else { Vec::new() };
+        let n = new.len().max(old.len());
+        let total = dw * n as f32 + sw;
+        let x0 = match style.align {
+            Align::Start => r.x,
+            Align::Center => r.cx() - total * 0.5,
+            Align::End => r.right() - total,
+        };
+        let mut cs = *style;
+        cs.align = Align::Center;
+        let grew = cur.parse::<i64>().unwrap_or(0) >= prev.parse::<i64>().unwrap_or(0);
+        let dir = if grew { 1.0 } else { -1.0 };
+        let e = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
+        let a0 = self.p.alpha;
+        self.p.push_clip(Rect::new(x0 - 2.0, r.y, total + 4.0, r.h));
+        for i in 0..n {
+            let x = x0 + dw * i as f32;
+            let nc = i.checked_sub(n - new.len()).and_then(|k| new.get(k)).copied();
+            let oc = i.checked_sub(n - old.len()).and_then(|k| old.get(k)).copied();
+            if !rolling || nc == oc {
+                if let Some(c) = nc {
+                    self.p.text(&c.to_string(), Rect::new(x, r.y, dw, r.h), &cs);
+                }
+                continue;
+            }
+            if let Some(c) = oc {
+                self.p.alpha = a0 * (1.0 - e);
+                self.p.text(&c.to_string(), Rect::new(x, r.y - dir * r.h * e, dw, r.h), &cs);
+            }
+            if let Some(c) = nc {
+                self.p.alpha = a0 * e;
+                self.p.text(&c.to_string(), Rect::new(x, r.y + dir * r.h * (1.0 - e), dw, r.h), &cs);
+            }
+            self.p.alpha = a0;
+        }
+        self.p.pop_clip();
+        if sw > 0.0 {
+            let mut ss = *style;
+            ss.align = Align::Start;
+            self.p.text(suffix, Rect::new(x0 + dw * n as f32, r.y, sw + 4.0, r.h), &ss);
+        }
+        if rolling {
+            self.fx.animate = true;
         }
     }
 

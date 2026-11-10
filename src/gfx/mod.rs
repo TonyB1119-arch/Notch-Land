@@ -289,6 +289,8 @@ pub struct Res {
     bitmaps: HashMap<u64, CachedBitmap>,
     tnum: Option<IDWriteTypography>,
     shadow: Option<ID2D1Bitmap1>,
+    /// The same shadow with squircle corners (the Alcove notch's shape).
+    shadow_sq: Option<ID2D1Bitmap1>,
     /// Tessellated shapes kept on the GPU (see `Painter::fill_cached`).
     realizations: std::cell::RefCell<HashMap<RKey, (ID2D1GeometryRealization, u64)>>,
     frame: u64,
@@ -385,6 +387,7 @@ impl Res {
                 bitmaps: HashMap::new(),
                 tnum,
                 shadow: None,
+                shadow_sq: None,
                 realizations: std::cell::RefCell::new(HashMap::new()),
                 frame: 0,
                 band_mask: None,
@@ -1117,6 +1120,64 @@ impl<'a> Painter<'a> {
         icons::draw(self, icon, r, c);
     }
 
+    // -- notch shadow -------------------------------------------------------
+
+    /// A soft shadow that follows the notch's own outline: a stack of many thin rings, each the notch
+    /// grown a little more, with the notch itself cut out (so the shadow never darkens the glass and
+    /// there is no gap). The rings' opacities add up to a smooth Gaussian-like falloff, and the whole
+    /// shadow fades to nothing toward the top edge so it has no hard corners there.
+    pub fn notch_shadow(&self, body: Rect, radius: f32, ear: f32, opacity: f32) {
+        if opacity <= 0.004 || body.w <= 4.0 || body.h <= 4.0 {
+            return;
+        }
+        let (x0, x1) = (body.x, body.right());
+        let h = body.h.max(1.0);
+        let r0 = radius.min(body.w * 0.5).min(h - ear.min(h * 0.5)).max(0.0);
+        let e = ear.min(h * 0.5).max(0.0);
+        let alcove = crate::ui::look_alcove() && r0 * 2.0 < body.w - 0.5;
+        let (ex, ey, tp, cn, en) =
+            if alcove { (e, (e * EAR_TALL).min(h * 0.5), wall_taper(h), CORNER_N, EAR_N) } else { (e, e, 0.0, 2.0, 2.0) };
+        let r = if alcove { r0.min(h - ey).max(0.0) } else { r0 };
+        // the notch itself (the same 20 steps as `notch_path`), walked backwards so it cuts a hole out of each ring
+        let hole: Vec<(f32, f32)> = notch_outline(x0, x1, h, r, ex, ey, tp, cn, en, 20).into_iter().rev().collect();
+        const LAYERS: usize = 24;
+        const SPREAD: f32 = 28.0;
+        let sigma = SPREAD / 2.0;
+        // how dark the shadow is in ring `k` (1 = next to the notch); nothing beyond the last ring
+        let target = |k: usize| -> f32 {
+            if k > LAYERS {
+                return 0.0;
+            }
+            let d = SPREAD * (k as f32 - 0.5) / LAYERS as f32;
+            opacity * (-0.5 * (d / sigma).powi(2)).exp()
+        };
+        // toward the top edge the shadow thins out to nothing
+        let ramp = (h * 0.45).clamp(12.0, 70.0);
+        for k in 1..=LAYERS {
+            let a = 1.0 - (1.0 - target(k)) / (1.0 - target(k + 1));
+            if a <= 0.0015 {
+                continue;
+            }
+            let d = SPREAD * k as f32 / LAYERS as f32;
+            // a little more room below than at the sides, like a light from above
+            let outer = notch_outline(x0 - d, x1 + d, h + d * 1.2, r + d, ex, ey, tp, cn, en, 8);
+            let Some(g) = self.path(|b| {
+                for pts in [&outer, &hole] {
+                    let mut it = pts.iter();
+                    if let Some(&(x, y)) = it.next() {
+                        b.move_to(x, y);
+                        for &(x, y) in it {
+                            b.line_to(x, y);
+                        }
+                    }
+                }
+            }) else {
+                continue;
+            };
+            self.fill_geometry_vgrad(&g, 0.0, ramp, &[(0.0, Color::black(0.0)), (1.0, Color::black(a))]);
+        }
+    }
+
     // -- shadow -------------------------------------------------------------
 
     /// Soft outer shadow around a rounded rect, drawn as a 9-slice of one
@@ -1125,10 +1186,15 @@ impl<'a> Painter<'a> {
         if opacity * self.alpha <= 0.002 || r.w <= 1.0 || r.h <= 1.0 {
             return;
         }
-        if self.res.shadow.is_none() {
-            self.res.shadow = make_shadow_bitmap(&self.res.dc);
+        // Alcove: squircle corners, so the shadow follows the notch's own corners
+        let sq = crate::ui::look_alcove();
+        if sq && self.res.shadow_sq.is_none() {
+            self.res.shadow_sq = make_shadow_bitmap(&self.res.dc, 3.1);
         }
-        let Some(bmp) = &self.res.shadow else { return };
+        if !sq && self.res.shadow.is_none() {
+            self.res.shadow = make_shadow_bitmap(&self.res.dc, 2.0);
+        }
+        let Some(bmp) = (if sq { &self.res.shadow_sq } else { &self.res.shadow }) else { return };
         let src_corner = (SHADOW_R + SHADOW_B) * SHADOW_SCALE;
         let size = 2.0 * src_corner + 2.0;
         // destination corner scales with the current corner radius
@@ -1327,6 +1393,13 @@ pub struct Snapshot {
     px: (u32, u32),
     /// The strip with its blur already blended in (see `Res::bake_band`).
     baked: Option<(ID2D1Bitmap1, ID2D1BitmapBrush1)>,
+    /// The full-size picture itself (the one behind `brush`).
+    src: ID2D1Bitmap1,
+    /// Smaller copies for blurring: entry k is the picture at 1/2^(k+1) of its size (made when first needed).
+    mips: Vec<ID2D1Bitmap1>,
+    /// Where a blur is drawn into, and the part of it that holds this frame's blur (width, height in px).
+    blur: Option<ID2D1Bitmap1>,
+    blur_used: Option<(u32, u32)>,
 }
 
 /// The glass rim as one small picture (see `refract`), and where it sits in logical units.
@@ -1644,6 +1717,8 @@ impl Res {
                 old.rect = Rect::new(x0 / scale, y0 / scale, w as f32 / scale, h as f32 / scale);
                 old.key = key;
                 old.born = std::time::Instant::now();
+                old.blur_used = None;
+                old.mips.clear();
                 return Some(old);
             }
             let bmp = dc.CreateBitmap(D2D_SIZE_U { width: w, height: h }, None, 0, &props).ok()?;
@@ -1719,7 +1794,130 @@ impl Res {
                 bufs,
                 px: (w, h),
                 baked: None,
+                src: bmp.clone(),
+                mips: Vec::new(),
+                blur: None,
+                blur_used: None,
             })
+        }
+    }
+}
+
+impl Snapshot {
+    /// Let go of the blur pictures (memory) once nothing is blurring any more.
+    pub fn release_blur(&mut self) {
+        self.blur = None;
+        self.mips.clear();
+        self.blur_used = None;
+    }
+}
+
+impl Res {
+    /// Blur a picture by about `sigma` device pixels. It is shrunk in halves to a small size, the
+    /// last step lands on an exact size (so the strength changes smoothly), and it is then stretched
+    /// back up in steps of at most 2x, so the result is smooth instead of blocky. The only pictures
+    /// kept are the small ones, and they are let go when the blur is over. Returns false when there
+    /// is nothing to blur (the sharp picture is then drawn instead).
+    pub fn blur_snapshot(&mut self, s: &mut Snapshot, sigma: f32) -> bool {
+        s.blur_used = None;
+        if sigma < 0.9 {
+            s.release_blur();
+            return false;
+        }
+        let (w, h) = s.px;
+        let f = (sigma / 0.43).clamp(2.0, 64.0);
+        let k = (f.log2().floor().max(1.0) as usize).min(6);
+        let dc = self.dc.clone();
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+            colorContext: ManuallyDrop::new(None),
+        };
+        let ident = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
+        let clear = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+        // `from` (or just its top-left `part` of pixels) drawn into `to`, stretched to nw x nh pixels
+        let draw = |from: &ID2D1Bitmap1, to: &ID2D1Bitmap1, nw: u32, nh: u32, part: Option<(u32, u32)>| -> bool {
+            let Ok(src) = from.cast::<ID2D1Bitmap>() else { return false };
+            let part = part.map(|(a, b)| D2D_RECT_F { left: 0.0, top: 0.0, right: a as f32, bottom: b as f32 });
+            unsafe {
+                dc.SetTarget(to);
+                dc.SetTransform(&ident);
+                dc.BeginDraw();
+                dc.Clear(Some(&clear));
+                let d = D2D_RECT_F { left: 0.0, top: 0.0, right: nw as f32, bottom: nh as f32 };
+                match &part {
+                    Some(r) => dc.DrawBitmap(&src, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, Some(r), None),
+                    None => dc.DrawBitmap(&src, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None),
+                }
+                let ok = dc.EndDraw(None, None).is_ok();
+                dc.SetTarget(None);
+                ok
+            }
+        };
+        let dims = |lvl: usize| (w.div_ceil(1u32 << lvl).max(1), h.div_ceil(1u32 << lvl).max(1));
+        // the small pictures (made once; they are redrawn every frame)
+        while s.mips.len() < k {
+            let (nw, nh) = dims(s.mips.len() + 1);
+            let Ok(next) = (unsafe { dc.CreateBitmap(D2D_SIZE_U { width: nw, height: nh }, None, 0, &props) }) else {
+                s.release_blur();
+                return false;
+            };
+            s.mips.push(next);
+        }
+        // the exact-size picture: never larger than half the original
+        let (sw, sh) = (((w as f32 / f).ceil() as u32).max(2), ((h as f32 / f).ceil() as u32).max(2));
+        if s.blur.is_none() {
+            let (bw, bh) = dims(1);
+            s.blur = unsafe { dc.CreateBitmap(D2D_SIZE_U { width: bw + 2, height: bh + 2 }, None, 0, &props) }.ok();
+        }
+        let Some(blur) = &s.blur else { return false };
+        // shrink
+        for lvl in 1..=k {
+            let from = if lvl == 1 { &s.src } else { &s.mips[lvl - 2] };
+            let (nw, nh) = dims(lvl);
+            if !draw(from, &s.mips[lvl - 1], nw, nh, None) {
+                return false;
+            }
+        }
+        if !draw(&s.mips[k - 1], blur, sw, sh, None) {
+            return false;
+        }
+        // stretch back up, never more than 2x at a time
+        let (nw, nh) = dims(k);
+        if !draw(blur, &s.mips[k - 1], nw, nh, Some((sw, sh))) {
+            return false;
+        }
+        for lvl in (1..k).rev() {
+            let (nw, nh) = dims(lvl);
+            if !draw(&s.mips[lvl], &s.mips[lvl - 1], nw, nh, None) {
+                return false;
+            }
+        }
+        s.blur_used = Some((0, 0));
+        true
+    }
+}
+
+impl<'a> Painter<'a> {
+    /// Draw a snapshot as prepared by `Res::blur_snapshot` (the sharp picture if it was not blurred).
+    pub fn snapshot_blurred(&self, s: &Snapshot, dx: f32, dy: f32, opacity: f32) {
+        let a = opacity * self.alpha;
+        if a <= 0.002 {
+            return;
+        }
+        let Some(bm) = s.blur_used.and(s.mips.first()).and_then(|m| m.cast::<ID2D1Bitmap>().ok()) else {
+            self.snapshot(s, dx, dy, opacity);
+            return;
+        };
+        let (x, y) = (s.rect.x + dx, s.rect.y + dy);
+        let dest = D2D_RECT_F { left: x, top: y, right: x + s.rect.w, bottom: y + s.rect.h };
+        unsafe {
+            self.dc.DrawBitmap(&bm, Some(&dest), a, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
         }
     }
 }
@@ -1802,7 +2000,7 @@ const SHADOW_SCALE: f32 = 2.0; // bitmap pixels per DIP
 
 /// Black gaussian falloff *outside* a rounded rect; transparent inside, so
 /// it never darkens translucent glass drawn on top.
-fn make_shadow_bitmap(dc: &ID2D1DeviceContext) -> Option<ID2D1Bitmap1> {
+fn make_shadow_bitmap(dc: &ID2D1DeviceContext, corner_n: f32) -> Option<ID2D1Bitmap1> {
     let corner = (SHADOW_R + SHADOW_B) * SHADOW_SCALE;
     let n = (2.0 * corner + 2.0) as usize;
     let c = n as f32 * 0.5;
@@ -1814,7 +2012,7 @@ fn make_shadow_bitmap(dc: &ID2D1DeviceContext) -> Option<ID2D1Bitmap1> {
         for x in 0..n {
             let qx = ((x as f32 + 0.5 - c).abs() - (half - r)).max(0.0);
             let qy = ((y as f32 + 0.5 - c).abs() - (half - r)).max(0.0);
-            let d = (qx * qx + qy * qy).sqrt() - r;
+            let d = (qx.powf(corner_n) + qy.powf(corner_n)).powf(1.0 / corner_n) - r;
             let a = if d <= 0.0 { 0.0 } else { (-0.5 * (d / sigma).powi(2)).exp() * (d / 1.5).min(1.0) };
             px[(y * n + x) * 4 + 3] = (a * 255.0).round() as u8; // premultiplied black
         }
@@ -1835,6 +2033,46 @@ fn make_shadow_bitmap(dc: &ID2D1DeviceContext) -> Option<ID2D1Bitmap1> {
         )
         .ok()
     }
+}
+
+/// The Alcove notch silhouette as a list of points: exactly the shape `notch_path` draws (ears, narrowing
+/// walls, squircle bottom corners) when `steps` is 20, so a shadow built from it fits with no gap.
+#[allow(clippy::too_many_arguments)]
+fn notch_outline(x0: f32, x1: f32, h: f32, r: f32, ex: f32, ey: f32, tp: f32, cn: f32, en: f32, steps: usize) -> Vec<(f32, f32)> {
+    let se = |n: f32, i: usize| {
+        let t = i as f32 / steps as f32 * std::f32::consts::FRAC_PI_2;
+        (t.cos().max(0.0).powf(2.0 / n), t.sin().max(0.0).powf(2.0 / n))
+    };
+    let mut v = Vec::with_capacity(4 * steps + 8);
+    v.push((x0 - ex, 0.0));
+    if ex > 0.0 {
+        for i in 1..=steps {
+            let (c, s) = se(en, steps - i);
+            v.push((x0 - ex + ex * c, ey - ey * s));
+        }
+    }
+    v.push((x0 + tp, h - r));
+    if r > 0.0 {
+        for i in 1..=steps {
+            let (c, s) = se(cn, i);
+            v.push((x0 + tp + r - r * c, h - r + r * s));
+        }
+    }
+    v.push((x1 - tp - r, h));
+    if r > 0.0 {
+        for i in 1..=steps {
+            let (c, s) = se(cn, i);
+            v.push((x1 - tp - r + r * s, h - r + r * c));
+        }
+    }
+    v.push((x1, ey));
+    if ex > 0.0 {
+        for i in 1..=steps {
+            let (c, s) = se(en, i);
+            v.push((x1 + ex - ex * c, ey - ey * s));
+        }
+    }
+    v
 }
 
 /// Helper to build path geometries without exposing the sink everywhere.
@@ -1987,14 +2225,83 @@ impl PathBuilder {
     }
 }
 
+/// How square the bottom corners of the Alcove notch are: the curve is a superellipse, |x|^n + |y|^n = 1
+/// (2 is a circle, 4 a squircle). Measured from the reference notch: about 3.1.
+pub const CORNER_N: f32 = 3.1;
+/// The same for the concave ears at the top (a little softer than a circle).
+const EAR_N: f32 = 2.3;
+/// An ear is taller than it is wide, like the reference's (about 1.35 times).
+const EAR_TALL: f32 = 1.35;
+/// How far (in px, per side) the side walls of a tall Alcove notch lean inward by the bottom.
+pub const WALL_TAPER: f32 = 3.5;
+pub fn wall_taper(h: f32) -> f32 {
+    if crate::ui::look_alcove() {
+        ((h - 70.0) / 90.0).clamp(0.0, 1.0) * WALL_TAPER
+    } else {
+        0.0
+    }
+}
+
 /// Notch silhouette: flush with the top edge, concave "ears" where it meets
-/// the screen edge and rounded bottom corners.
+/// the screen edge and rounded bottom corners. In the Alcove look the corners are squircles and the
+/// ears long and soft (see `CORNER_N`); everything else keeps plain circular arcs.
 pub fn notch_path(p: &Painter, body: Rect, bottom_radius: f32, ear: f32) -> Option<ID2D1Geometry> {
     let x0 = body.x;
     let x1 = body.right();
     let h = body.h.max(1.0);
     let r = bottom_radius.min(body.w * 0.5).min(h - ear.min(h * 0.5)).max(0.0);
     let e = ear.min(h * 0.5).max(0.0);
+    // (a full half-circle, the round bubbles, stays a circle)
+    if crate::ui::look_alcove() && r * 2.0 < body.w - 0.5 {
+        let ex = e;
+        let ey = (e * EAR_TALL).min(h * 0.5);
+        let r = r.min(h - ey).max(0.0);
+        let tp = wall_taper(h);
+        const STEPS: usize = 20;
+        // a point a quarter of the way round a superellipse: (cos^(2/n), sin^(2/n)) for t in 0..1
+        let se = |n: f32, i: usize| {
+            let t = i as f32 / STEPS as f32 * std::f32::consts::FRAC_PI_2;
+            (t.cos().max(0.0).powf(2.0 / n), t.sin().max(0.0).powf(2.0 / n))
+        };
+        let squircle = p.path(|b| {
+            b.move_to(x0 - ex, 0.0);
+            if ex > 0.0 {
+                // left ear: from the top edge, round to the side wall
+                for i in 1..=STEPS {
+                    let (c, s) = se(EAR_N, STEPS - i);
+                    b.line_to(x0 - ex + ex * c, ey - ey * s);
+                }
+            }
+            b.line_to(x0 + tp, h - r);
+            if r > 0.0 {
+                // bottom left
+                for i in 1..=STEPS {
+                    let (c, s) = se(CORNER_N, i);
+                    b.line_to(x0 + tp + r - r * c, h - r + r * s);
+                }
+            }
+            b.line_to(x1 - tp - r, h);
+            if r > 0.0 {
+                // bottom right
+                for i in 1..=STEPS {
+                    let (c, s) = se(CORNER_N, i);
+                    b.line_to(x1 - tp - r + r * s, h - r + r * c);
+                }
+            }
+            b.line_to(x1, ey);
+            if ex > 0.0 {
+                // right ear
+                for i in 1..=STEPS {
+                    let (c, s) = se(EAR_N, i);
+                    b.line_to(x1 + ex - ex * c, ey - ey * s);
+                }
+            }
+            b.close();
+        });
+        if squircle.is_some() {
+            return squircle;
+        }
+    }
     p.path(|b| {
         b.move_to(x0 - e, 0.0);
         if e > 0.0 {
