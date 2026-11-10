@@ -78,9 +78,8 @@ const MODULE_CHOICES: [(&str, &str); 21] = [
 ];
 
 /// Tabs that can be reordered: (config id, label), in the default order.
-const TAB_CHOICES: [(&str, &str); 14] = [
+const TAB_CHOICES: [(&str, &str); 13] = [
     ("timer", "Timer"),
-    ("stats", "System Stats"),
     ("voice", "Dictation"),
     ("clipboard", "Clipboard"),
     ("downloads", "Downloads"),
@@ -286,7 +285,7 @@ fn tab_order(saved: &[String]) -> Vec<String> {
 fn tab_rows(tab: usize) -> f32 {
     match tab {
         0 => 14.0,
-        1 => 18.0,
+        1 => 22.0,
         2 => 5.6,
         3 => 5.5,
         4 => 4.0,
@@ -294,7 +293,7 @@ fn tab_rows(tab: usize) -> f32 {
         6 => 5.6,
         7 => 5.9,
         8 => 24.0,
-        9 => 34.0,
+        9 => 33.0,
         10 => 14.0,
         11 => 22.0,
         _ => 25.0,
@@ -811,14 +810,6 @@ impl Settings {
         toggle_row(
             ui,
             row_rect(body, 12),
-            "Soft blur at the bottom edge",
-            a.bottom_fade,
-            "appearance",
-            "bottom_fade",
-        );
-        toggle_row(
-            ui,
-            row_rect(body, 13),
             "Liquid glass: notch edge (bends what is behind)",
             a.glass_look,
             "appearance",
@@ -826,7 +817,7 @@ impl Settings {
         );
         toggle_row(
             ui,
-            row_rect(body, 14),
+            row_rect(body, 13),
             "Live glass while media plays",
             a.glass_live,
             "appearance",
@@ -834,7 +825,7 @@ impl Settings {
         );
         slider_row(
             ui,
-            row_rect(body, 15),
+            row_rect(body, 14),
             "Max frame rate",
             a.max_fps,
             (30.0, 240.0),
@@ -844,13 +835,41 @@ impl Settings {
         );
         toggle_row(
             ui,
-            row_rect(body, 16),
+            row_rect(body, 15),
             "Lighter animations (less CPU)",
             a.lite_motion,
             "appearance",
             "lite_motion",
         );
-        toggle_row(ui, row_rect(body, 17), "Monochrome icons", a.mono_icons, "appearance", "mono_icons");
+        toggle_row(ui, row_rect(body, 16), "Monochrome icons", a.mono_icons, "appearance", "mono_icons");
+        toggle_row(ui, row_rect(body, 17), "Blur between pages (instead of sliding)", a.page_blur, "appearance", "page_blur");
+        toggle_row(
+            ui,
+            row_rect(body, 18),
+            "Launcher inside the notch (off = Tuna's launcher)",
+            self.cfg.launcher.alcove,
+            "launcher",
+            "alcove",
+        );
+        for (i, (name, val, key)) in [
+            ("Page switch time (higher = slower)", a.page_time, "page_time"),
+            ("Notch close time (higher = slower)", a.close_time, "close_time"),
+            ("Notch open time (higher = slower)", a.open_time, "open_time"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            slider_row(
+                ui,
+                row_rect(body, 19 + i),
+                name,
+                val,
+                (0.4, 2.5),
+                format!("{val:.1}×"),
+                "appearance",
+                key,
+            );
+        }
     }
 
     fn home(&mut self, ui: &mut Ui, body: Rect) {
@@ -1141,14 +1160,13 @@ impl Settings {
     fn glass(&mut self, ui: &mut Ui, body: Rect) {
         let g = self.cfg.glass.clone();
         // (label, value, range, shown, key)
-        let rows: [(&str, f32, (f32, f32), String, &str); 23] = [
+        let rows: [(&str, f32, (f32, f32), String, &str); 22] = [
             ("Edge width", g.edge_width, (20.0, 160.0), format!("{:.0}", g.edge_width), "edge_width"),
             ("Warp strength", g.pull, (0.0, 60.0), format!("{:.0}", g.pull), "pull"),
             ("Bend curve", g.bend, (0.8, 3.0), format!("{:.1}", g.bend), "bend"),
             ("Edge opacity", g.strength, (0.3, 1.0), format!("{:.0}%", g.strength * 100.0), "strength"),
             ("Corner warp", g.corner, (0.0, 1.0), format!("{:.0}%", g.corner * 100.0), "corner"),
             ("Colour fringing", g.fringe, (0.0, 0.2), format!("{:.0}%", g.fringe * 500.0), "fringe"),
-            ("Reach up the sides", g.reach, (30.0, 200.0), format!("{:.0}", g.reach), "reach"),
             ("Outer edge softness", g.softness, (0.5, 12.0), format!("{:.1}", g.softness), "softness"),
             ("Middle glass", g.middle, (0.0, 1.0), format!("{:.0}%", g.middle * 100.0), "middle"),
             ("Middle warp", g.middle_warp, (0.0, 1.0), format!("{:.0}%", g.middle_warp * 100.0), "middle_warp"),
@@ -1176,18 +1194,18 @@ impl Settings {
             slider_row(ui, row_rect(body, i), text, val, range, shown, "glass", key);
         }
         let d = crate::config::GlassCfg::default();
-        toggle_row(ui, row_rect(body, 23), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
-        toggle_row(ui, row_rect(body, 25), "Real glass bend (Snell's law)", g.snell, "glass", "snell");
-        toggle_row(ui, row_rect(body, 32), "Press glow (Alcove)", g.glow, "glass", "glow");
+        toggle_row(ui, row_rect(body, 22), "Stretch edge (iOS look)", g.stretch, "glass", "stretch");
+        toggle_row(ui, row_rect(body, 24), "Real glass bend (Snell's law)", g.snell, "glass", "snell");
+        toggle_row(ui, row_rect(body, 31), "Press glow (Alcove)", g.glow, "glass", "glow");
         let amt = ("Press glow strength", g.glow_amount, (0.0, 1.0), format!("{:.0}%", g.glow_amount * 100.0));
-        slider_row(ui, row_rect(body, 33), amt.0, amt.1, amt.2, amt.3, "glass", "glow_amount");
+        slider_row(ui, row_rect(body, 32), amt.0, amt.1, amt.2, amt.3, "glass", "glow_amount");
         let snell_rows: [(&str, f32, (f32, f32), String, &str); 3] = [
             ("Snell: glass index", g.snell_ior, (1.05, 2.4), format!("{:.2}", g.snell_ior), "snell_ior"),
             ("Snell: edge thickness", g.snell_thick, (0.3, 4.0), format!("{:.1}", g.snell_thick), "snell_thick"),
             ("Snell: edge roundness", g.snell_round, (2.0, 6.0), format!("{:.1}", g.snell_round), "snell_round"),
         ];
         for (i, (text, val, range, shown, key)) in snell_rows.into_iter().enumerate() {
-            slider_row(ui, row_rect(body, 26 + i), text, val, range, shown, "glass", key);
+            slider_row(ui, row_rect(body, 25 + i), text, val, range, shown, "glass", key);
         }
         let light_rows: [(&str, f32, (f32, f32), String, &str); 3] = [
             ("Rim light direction", g.light_angle, (0.0, 360.0), format!("{:.0}°", g.light_angle), "light_angle"),
@@ -1195,9 +1213,9 @@ impl Settings {
             ("Rim light width", g.light_width, (0.8, 6.0), format!("{:.1}", g.light_width), "light_width"),
         ];
         for (i, (text, val, range, shown, key)) in light_rows.into_iter().enumerate() {
-            slider_row(ui, row_rect(body, 29 + i), text, val, range, shown, "glass", key);
+            slider_row(ui, row_rect(body, 28 + i), text, val, range, shown, "glass", key);
         }
-        let b = row_rect(body, 24);
+        let b = row_rect(body, 23);
         let style = ButtonStyle::filled(Color::white(0.07)).fg(palette::TEXT_DIM);
         if ui.pill_button(Rect::new(b.x, b.y, 190.0, b.h), "Reset to defaults", None, style) {
             for (key, v) in [
@@ -1207,7 +1225,6 @@ impl Settings {
                 ("strength", d.strength),
                 ("corner", d.corner),
                 ("fringe", d.fringe),
-                ("reach", d.reach),
                 ("softness", d.softness),
                 ("middle", d.middle),
                 ("middle_warp", d.middle_warp),

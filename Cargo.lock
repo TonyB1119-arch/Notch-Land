@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "dynamic-notch"
-version = "3.0.204"
+version = "3.0.249"
 dependencies = [
  "serde",
  "serde_json",

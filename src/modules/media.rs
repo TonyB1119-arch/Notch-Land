@@ -31,6 +31,10 @@ use crate::util::{format_duration, palette, Color, Rect};
 
 const ID: ModuleId = "media";
 
+/// The media page: a big cover on the left, the title, artist and the three buttons on the right.
+const PAGE_H: f32 = 124.0;
+const PAGE_ART: f32 = 112.0;
+
 #[derive(Clone, Debug, Default)]
 struct Snapshot {
     active: bool,
@@ -95,6 +99,34 @@ pub struct Media {
     ly_at: Instant,
     /// After a click on the output button: what it should show until the system confirms.
     out_want: Option<(bool, Instant)>,
+    /// The app that plays (Spotify...) and its icon for the corner of the cover, once found.
+    badge_app: String,
+    badge: Option<ImageData>,
+}
+
+/// The icon of the app that plays, found in the background (`app` says which one it is for).
+struct Badge {
+    app: String,
+    img: Option<ImageData>,
+}
+
+/// Look for the playing app among the open windows and take its icon.
+fn spawn_badge(app: String, bus: Bus) {
+    if app.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("media-badge".into()).spawn(move || {
+        let hint = match app.as_str() {
+            "Microsoft Edge" => "msedge".to_string(),
+            other => other.to_lowercase().replace(' ', ""),
+        };
+        let found = crate::switcher::list().into_iter().find(|w| {
+            let name = w.app().to_lowercase();
+            !name.is_empty() && (name == hint || name.contains(&hint) || hint.contains(&name))
+        });
+        let img = found.and_then(|w| crate::dock::icon_for_path(&w.exe, &w.app()));
+        bus.to_module(ID, Badge { app, img });
+    });
 }
 
 /// A lyrics answer from the worker thread.
@@ -152,6 +184,8 @@ impl Media {
             ly_idx: 0,
             ly_at: Instant::now(),
             out_want: None,
+            badge_app: String::new(),
+            badge: None,
         }
     }
 
@@ -217,9 +251,8 @@ impl Media {
         }
     }
 
-    /// The button that moves the sound to the next output device. The icon (a laptop for the
-    /// built-in speakers, headphones for AirPods and the like) turns into the other one with a
-    /// short fade and turn.
+    /// The button that moves the sound to the next output device: a speaker for the built-in
+    /// ones, headphones for AirPods and the like, one turning into the other with a short fade.
     fn output_button(&mut self, ui: &mut Ui, r: Rect, fg: Color, scale: f32) {
         let hp = self.out_headphones();
         let (h, p) = ui.touch(r, "output-button");
@@ -228,16 +261,13 @@ impl Media {
         let size = r.w.min(r.h) * scale * (1.0 - 0.14 * p) * (1.0 + 0.03 * h);
         let (cx, cy) = (r.cx(), r.cy());
         let old = ui.p.alpha;
-        // the laptop leaves downward as the headphones come up from below
-        if k < 0.995 {
-            let a = 1.0 - k;
-            ui.p.alpha = old * a;
-            draw_laptop(&mut ui.p, cx, cy + k * 5.0, size * (0.7 + 0.3 * a), fg);
-        }
-        if k > 0.005 {
-            ui.p.alpha = old * k;
-            let s = size * (0.7 + 0.3 * k);
-            ui.p.icon(Icon::Headphones, Rect::new(cx - s * 0.5, cy + (1.0 - k) * 5.0 - s * 0.5, s, s), fg);
+        // the speaker leaves downward as the headphones come up from below
+        for (icon, a, dy) in [(Icon::Volume, 1.0 - k, k * 5.0), (Icon::Headphones, k, (1.0 - k) * 5.0)] {
+            if a > 0.005 {
+                ui.p.alpha = old * a;
+                let s = size * (0.7 + 0.3 * a);
+                ui.p.icon(icon, Rect::new(cx - s * 0.5, cy + dy - s * 0.5, s, s), fg);
+            }
         }
         ui.p.alpha = old;
         if ui.clicked(r) {
@@ -291,6 +321,16 @@ impl Module for Media {
             Ok(l) => {
                 if l.key == self.lyrics_key {
                     self.lyrics = l.lines;
+                    cx.fx.redraw = true;
+                }
+                return;
+            }
+            Err(m) => m,
+        };
+        let msg = match msg.downcast::<Badge>() {
+            Ok(b) => {
+                if b.app == self.badge_app {
+                    self.badge = b.img;
                     cx.fx.redraw = true;
                 }
                 return;
@@ -464,26 +504,29 @@ impl Module for Media {
     }
 
     fn page_height(&self, _width: f32) -> f32 {
-        // taller while the lyrics show
-        if self.show_lyrics && !self.lyrics.is_empty() {
-            186.0
-        } else {
-            132.0
-        }
+        PAGE_H
     }
 
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
         self.last_draw = Some(ui.now);
+        let playing = self.playing();
         let lyrics_on = self.show_lyrics && !self.lyrics.is_empty();
+        // which app plays: its icon sits in the corner of the cover
+        if self.badge_app != self.snap.app {
+            self.badge_app = self.snap.app.clone();
+            self.badge = None;
+            spawn_badge(self.snap.app.clone(), ui.bus.clone());
+        }
 
-        // cover (it flips over when the track changes); a click switches lyrics and controls
-        let art_s = 66.0;
-        let art = Rect::new(r.x, r.y + 2.0, art_s, art_s);
+        // the cover, big and round (it flips over when the track changes); a click switches lyrics and text
+        let art_s = r.h.min(PAGE_ART);
+        let art = Rect::new(r.x, r.cy() - art_s * 0.5, art_s, art_s);
         if !self.lyrics.is_empty() && ui.clicked(art) {
             self.show_lyrics = !self.show_lyrics;
         }
         let (mut shown, mut k) = (self.snap.art.as_ref(), 1.0f32);
-        if let Some(p) = self.flip() {
+        let flipping = self.flip();
+        if let Some(p) = flipping {
             k = (p * std::f32::consts::PI).cos().abs().max(0.02);
             if p < 0.5 {
                 shown = self.prev.as_ref().and_then(|x| x.2.as_ref());
@@ -492,95 +535,70 @@ impl Module for Media {
         }
         let face = Rect::centered(art.cx(), art.cy(), art_s * k, art_s * (0.93 + 0.07 * k));
         match shown {
-            Some(img) => ui.p.image(img, face, art_s * 0.22 * k.max(0.4), 1.0),
+            Some(img) => ui.p.image(img, face, art_s * 0.24 * k.max(0.4), 1.0),
             None => {
+                ui.p.fill_rounded(face, art_s * 0.24 * k.max(0.4), Color::white(0.08));
                 ui.p.icon(
                     Icon::Music,
-                    Rect::centered(face.cx(), face.cy(), face.w * 0.5, art_s * 0.5),
+                    Rect::centered(face.cx(), face.cy(), face.w * 0.4, art_s * 0.4),
                     Color::white(0.55),
                 );
             }
         }
+        if let (Some(b), None) = (&self.badge, flipping) {
+            let bs = art_s * 0.27;
+            let back = Rect::new(art.x + art_s * 0.07, art.bottom() - art_s * 0.07 - bs - 8.0, bs + 8.0, bs + 8.0);
+            ui.p.fill_rounded(back, 11.0, Color::black(0.88));
+            ui.p.image(b, back.inset(4.0), 8.0, 1.0);
+        }
 
-        // title and artist, and the little level glyph
-        let tx = art.right() + 14.0;
-        let tw = r.right() - tx;
+        // the words and the buttons, together in the middle of the right side
+        let tx = art.right() + 18.0;
+        let tw = (r.right() - tx).max(60.0);
         let title = if self.snap.title.is_empty() { "Unknown title" } else { &self.snap.title };
         let sub = if !self.snap.artist.is_empty() { self.snap.artist.clone() } else { self.snap.app.clone() };
-        let glyph_w = 26.0;
-        ui.p.push_clip(Rect::new(tx, r.y, tw - glyph_w - 10.0, 68.0));
-        ui.p.text(title, Rect::new(tx, r.y + 6.0, tw, 28.0), &TextStyle::new(18.0, Color::white(1.0)).semibold());
-        ui.p.text(&sub, Rect::new(tx, r.y + 34.0, tw, 24.0), &TextStyle::new(15.0, palette::TEXT_DIM));
-        ui.p.pop_clip();
-        let playing = self.playing();
-        let secs = crate::ui::epoch_secs();
-        for i in 0..4 {
-            let lvl = if playing {
-                0.35 + 0.65 * ((secs * (3.1 + i as f32 * 1.3) + i as f32 * 1.7).sin() * 0.5 + 0.5)
-            } else {
-                0.25
-            };
-            let h = 4.0 + 16.0 * lvl;
-            let x = r.right() - glyph_w + i as f32 * 7.0;
-            ui.p.fill_rounded(Rect::new(x, r.y + 18.0 - h * 0.5, 4.0, h), 2.0, Color::white(0.85));
-        }
-        if playing {
-            ui.animate();
-        }
-
-        let pos = self.position();
-        let dur = self.snap.duration;
-        let mut y = r.y + 74.0;
-
-        // the line being sung (and the next one)
+        let tst = TextStyle::new(18.0, Color::white(1.0)).semibold().top().wrap();
+        let (_, line) = ui.p.measure(title, &tst);
+        let lines = (ui.p.measure_wrapped(title, &tst, tw) / line.max(1.0)).round().clamp(1.0, 2.0);
+        let th = line * lines;
+        let text_h = if lyrics_on { 58.0 } else { th + 2.0 + 22.0 };
+        let ctl_h = 40.0;
+        let y0 = r.cy() - (text_h + 8.0 + ctl_h) * 0.5;
         if lyrics_on {
-            self.draw_lyrics(ui, Rect::new(r.x, y, r.w, 50.0), pos);
-            y += 56.0;
-        }
-
-        // time, thin bar, time
-        let ts = TextStyle::new(12.5, palette::TEXT_DIM).medium();
-        let tw_t = 46.0;
-        ui.p.text(&format_duration(pos), Rect::new(r.x, y, tw_t, 18.0), &ts);
-        if dur > 0.0 {
-            ui.p.text(&format_duration(dur), Rect::new(r.right() - tw_t, y, tw_t, 18.0), &ts.right());
-        }
-        let bar = Rect::new(r.x + tw_t + 6.0, y + 6.0, (r.w - 2.0 * (tw_t + 6.0)).max(40.0), 5.0);
-        let frac = if dur > 0.0 { (pos / dur) as f32 } else { 0.0 };
-        ui.p.fill_rounded(bar, 2.5, Color::white(0.18));
-        if frac > 0.0 {
-            ui.p.fill_rounded(Rect::new(bar.x, bar.y, (bar.w * frac).max(5.0), bar.h), 2.5, Color::white(0.95));
-        }
-        if self.snap.can_seek && dur > 0.0 {
-            if let Some(f) = ui.clicked_at(bar.inset_xy(-4.0, -9.0)) {
-                let target = f as f64 * dur;
-                self.snap.position = target;
-                self.stamp = Instant::now();
-                self.send(Cmd::Seek(target));
+            let pos = self.position();
+            self.draw_lyrics(ui, Rect::new(tx, y0, tw, text_h), pos);
+            if playing {
+                // the line moves on by itself
+                ui.animate_slow();
             }
+        } else {
+            let box_ = Rect::new(tx, y0, tw, th);
+            ui.p.push_clip(box_);
+            ui.p.text(title, box_, &tst);
+            ui.p.pop_clip();
+            ui.p.text(&sub, Rect::new(tx, y0 + th + 2.0, tw, 22.0), &TextStyle::new(15.0, palette::TEXT_DIM));
         }
-        y += 26.0;
 
-        // controls: back, play or pause, forward - plain white glyphs
-        let cy = (y + (r.bottom() - y) * 0.5).min(y + 24.0);
-        let cx = r.cx();
+        // back, play or pause, forward: plain white glyphs, left-aligned under the words
+        let cy = y0 + text_h + 8.0 + ctl_h * 0.5;
         let dim = |on: bool| if on { Color::white(0.97) } else { Color::white(0.35) };
         let side = ButtonStyle::default().scale(0.85);
-        if ui.icon_button(Rect::centered(cx - 76.0, cy, 44.0, 40.0), Icon::Prev, side.fg(dim(self.snap.can_prev))) {
+        let x1 = tx + 14.0;
+        if ui.icon_button(Rect::centered(x1, cy, 44.0, ctl_h), Icon::Prev, side.fg(dim(self.snap.can_prev))) {
             self.send(Cmd::Prev);
         }
         let pp = if playing { Icon::Pause } else { Icon::Play };
         if ui.icon_button(
-            Rect::centered(cx, cy, 52.0, 44.0),
+            Rect::centered(x1 + 56.0, cy, 52.0, 44.0),
             pp,
-            ButtonStyle::default().fg(Color::white(1.0)).scale(0.9),
+            ButtonStyle::default().fg(Color::white(1.0)).scale(0.95),
         ) {
             self.toggle();
         }
-        if ui.icon_button(Rect::centered(cx + 76.0, cy, 44.0, 40.0), Icon::Next, side.fg(dim(self.snap.can_next))) {
+        if ui.icon_button(Rect::centered(x1 + 112.0, cy, 44.0, ctl_h), Icon::Next, side.fg(dim(self.snap.can_next))) {
             self.send(Cmd::Next);
         }
-        self.output_button(ui, Rect::centered(cx + 152.0, cy, 44.0, 40.0), Color::white(0.97), 0.85);
+        self.output_button(ui, Rect::centered(x1 + 168.0, cy, 44.0, ctl_h), Color::white(0.97), 0.85);
     }
 
     fn card(&self) -> Option<CardSize> {
@@ -701,14 +719,6 @@ impl Module for Media {
         let out = Rect::centered(next.cx() + small + 14.0, cy, small, small);
         self.output_button(ui, out, palette::TEXT, 0.5);
     }
-}
-
-/// A small laptop in the line style of the other icons: the screen, and the base under it.
-fn draw_laptop(p: &mut crate::gfx::Painter, cx: f32, cy: f32, s: f32, c: Color) {
-    let sw = (s * 0.085).max(1.3);
-    let screen = Rect::new(cx - s * 0.30, cy - s * 0.34, s * 0.60, s * 0.44);
-    p.stroke_rounded(screen.inset(sw * 0.5), s * 0.07, sw, c);
-    p.fill_rounded(Rect::new(cx - s * 0.46, cy + s * 0.17, s * 0.92, s * 0.11), s * 0.055, c);
 }
 
 // ---------------------------------------------------------------------------

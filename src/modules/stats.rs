@@ -122,8 +122,9 @@ impl Module for Stats {
         Some(CardSize::Small)
     }
 
+    /// The numbers live on the home page; there is no Stats tab.
     fn has_page(&self) -> bool {
-        true
+        false
     }
 
     fn page_height(&self, _w: f32) -> f32 {
@@ -175,9 +176,7 @@ impl Module for Stats {
     }
 
     fn draw_card(&mut self, ui: &mut Ui, r: Rect) {
-        if ui.card(r, true) {
-            ui.fx.open_page = Some(ID);
-        }
+        let _ = ui.card(r, false);
         let s = self.sample;
         let cols: [(&str, Option<f32>, String); 3] = [
             ("CPU", s.map(|s| s.cpu), pct(s.map(|s| s.cpu))),

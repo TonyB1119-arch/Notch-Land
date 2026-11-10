@@ -289,9 +289,8 @@ pub fn control_center(ui: &mut Ui, r: Rect, modules: &mut [Box<dyn Module>], sta
 
     // round actions
     let top = r.y + 2.0 * PILL_H + PILL_GAP + 18.0;
-    let acts: [(Icon, &str, bool); 6] = [
+    let acts: [(Icon, &str, bool); 5] = [
         (Icon::Moon, "Do not disturb", dnd()),
-        (Icon::Bolt, "stats", false),
         (Icon::Grid, "shelf", false),
         (Icon::Bell, "notifications", false),
         (Icon::Settings, "settings", false),
@@ -299,14 +298,13 @@ pub fn control_center(ui: &mut Ui, r: Rect, modules: &mut [Box<dyn Module>], sta
     ];
     let span = r.w - CIRCLE;
     for (i, (icon, what, on)) in acts.iter().enumerate() {
-        let c = Rect::new(r.x + span * i as f32 / 5.0, top, CIRCLE, CIRCLE);
+        let c = Rect::new(r.x + span * i as f32 / 4.0, top, CIRCLE, CIRCLE);
         if circle(ui, c, *icon, *on) {
             match *what {
                 "Do not disturb" => DND.store(!dnd(), Ordering::Relaxed),
                 "reload" => ui.fx.reload_config = true,
                 page => {
                     ui.fx.open_page = Some(match page {
-                        "stats" => "stats",
                         "shelf" => "shelf",
                         "notifications" => "notifications",
                         _ => "settings",

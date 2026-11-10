@@ -74,6 +74,8 @@ const WM_RATES: u32 = WM_APP + 33;
 const WM_PROCS: u32 = WM_APP + 34;
 /// A picture of a window (window switcher) is ready.
 const WM_PREVIEW: u32 = WM_APP + 35;
+/// The mouse was clicked on something other than the launcher (sent by the click watcher).
+const WM_OUTSIDE: u32 = WM_APP + 36;
 
 // -- layout (dips) -------------------------------------------------------------------------------------
 const PAD: f32 = 14.0;
@@ -995,6 +997,9 @@ impl Launcher {
                 let _ = SetFocus(Some(self.hwnd));
             }
         }
+        if focus {
+            watch_clicks(self.hwnd);
+        }
         self.draw(gfx);
     }
 
@@ -1005,6 +1010,7 @@ impl Launcher {
         }
         self.open = false;
         self.flashing = false;
+        unwatch_clicks();
         self.switch = None;
         self.stop_pick();
         unsafe {
@@ -2415,9 +2421,17 @@ impl Launcher {
 
     pub fn handle(&mut self, gfx: &Gfx, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         match msg {
+            WM_OUTSIDE => {
+                // a click anywhere else puts it away (the colour picker lets the pointer go anywhere)
+                if self.open && self.pick.is_none() {
+                    self.hide();
+                }
+                Some(LRESULT(0))
+            }
             WM_ACTIVATE => {
-                // it is a pop-up: clicking anywhere else puts it away
-                if (wp.0 & 0xFFFF) == 0 && self.open {
+                // losing the focus alone no longer closes it (a pop-up or a notification may take it for a
+                // moment); only a click does: this catches the click on a window the watcher cannot see
+                if (wp.0 & 0xFFFF) == 0 && self.open && self.pick.is_none() && mouse_down() {
                     self.hide();
                 }
                 Some(LRESULT(0))
@@ -2515,14 +2529,9 @@ impl Launcher {
                     if f == Focus::Action && self.cur().is_none() {
                         return Some(LRESULT(0));
                     }
-                    let same = self.focus == f;
                     self.focus = f;
-                    // a second click on the same box opens or closes its list
-                    self.list_open = if same {
-                        !self.list_open && self.rows_len() > 0
-                    } else {
-                        self.list_open && self.rows_len() > 0
-                    };
+                    // clicking a box only picks it: the list opens with the Down arrow, never with a click
+                    self.list_open = self.list_open && self.rows_len() > 0;
                     self.draw(gfx);
                 }
                 Some(LRESULT(0))
@@ -3170,6 +3179,7 @@ impl Drop for Launcher {
             for t in [T_ANIM, T_ICON, T_TRIM, T_FREE, T_LIVE, T_PICK, T_RESCAN, T_ALT] {
                 let _ = KillTimer(Some(self.hwnd), t);
             }
+            unwatch_clicks();
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -3603,6 +3613,56 @@ struct WinView<'a> {
 fn alt_down() -> bool {
     let state = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) };
     state as u16 & 0x8000 != 0
+}
+
+// -- click outside --------------------------------------------------------------------------------------
+
+/// The launcher window the click watcher reports to, and the watcher itself (0 = none). The watcher
+/// exists only while the launcher is open, so a closed launcher costs nothing.
+static CLICK_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static CLICK_HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Tell the launcher about every mouse click that lands outside it (the click itself goes on to where it was aimed).
+fn watch_clicks(hwnd: HWND) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if CLICK_HOOK.load(Relaxed) != 0 {
+        return;
+    }
+    CLICK_HWND.store(hwnd.0 as isize, Relaxed);
+    if let Ok(h) = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(click_hook), None, 0) } {
+        CLICK_HOOK.store(h.0 as isize, Relaxed);
+    }
+}
+
+fn unwatch_clicks() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let h = CLICK_HOOK.swap(0, Relaxed);
+    CLICK_HWND.store(0, Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
+        }
+    }
+}
+
+unsafe extern "system" fn click_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use std::sync::atomic::Ordering::Relaxed;
+    if code == 0 && matches!(wp.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN) {
+        let me = CLICK_HWND.load(Relaxed);
+        if me != 0 {
+            let hwnd = HWND(me as *mut _);
+            let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
+            if WindowFromPoint(info.pt) != hwnd {
+                let _ = PostMessageW(Some(hwnd), WM_OUTSIDE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+    CallNextHookEx(None, code, wp, lp)
+}
+
+/// Is a mouse button held down right now?
+fn mouse_down() -> bool {
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].iter().any(|k| unsafe { GetAsyncKeyState(k.0 as i32) } as u16 & 0x8000 != 0)
 }
 
 /// Where card `i` of `n` sits (the row is `scroll` cards along; with fewer cards than fit they are centred).
@@ -4359,6 +4419,112 @@ fn restart_app(exe: String, path: String) {
 /// The id of a clipboard history item (`clip:<id>`).
 fn clip_id(path: &str) -> Option<u64> {
     path.strip_prefix("clip:")?.parse().ok()
+}
+
+// -- for the Alcove launcher (src/modules/alcove_launcher.rs): it lives inside the notch and uses the helpers of
+// -- this file instead of copying them --------------------------------------------------------------------
+
+/// The answer to a sum, a conversion or a time question: (answer, what it was asked).
+pub(crate) fn bridge_answer(q: &str) -> Option<(String, String)> {
+    match conv::convert(q) {
+        Some(conv::Conv::Done { result, detail }) => return Some((result, detail)),
+        Some(conv::Conv::Money { amount, from, to }) => {
+            // only when today's rates are known already (the Tuna launcher fetches them)
+            if let Some(r) = rate(&from, &to) {
+                if let conv::Conv::Done { result, detail } = conv::money(amount, &from, &to, r) {
+                    return Some((result, detail));
+                }
+            }
+            return None;
+        }
+        None => {}
+    }
+    if let Some(t) = conv::time(q, unix_secs() as i64) {
+        return Some(t);
+    }
+    logic::calc(q).map(|r| (r, q.to_string()))
+}
+
+pub(crate) fn bridge_url(q: &str) -> Option<String> {
+    logic::as_url(q)
+}
+
+pub(crate) fn bridge_enc(q: &str) -> String {
+    logic::enc(q)
+}
+
+pub(crate) fn bridge_mid(q: &str, max: usize) -> String {
+    logic::mid(q, max)
+}
+
+/// The computer commands the typed text asks for: (place in the table, name, asks twice).
+pub(crate) fn bridge_system(q: &str) -> Vec<(usize, String, bool)> {
+    conv::system(q)
+        .into_iter()
+        .filter(|&i| i != conv::PICK_COLOR)
+        .map(|i| (i, conv::SYSTEM[i].0.to_string(), conv::SYSTEM[i].2))
+        .collect()
+}
+
+pub(crate) fn bridge_match(name: &str, q: &[u8], loose: bool, pos: &mut Vec<usize>) -> Option<i32> {
+    logic::matched(name.as_bytes(), q, loose, pos)
+}
+
+pub(crate) fn bridge_run_system(i: usize) {
+    run_system(i);
+}
+
+pub(crate) fn bridge_paste() {
+    paste_soon();
+}
+
+/// Ask the program at `path` to quit (or end it at once when `force`), in the background.
+pub(crate) fn bridge_quit(path: &str, force: bool) {
+    if let Some(exe) = exe_name(path) {
+        let _ = std::thread::Builder::new().name("launcher-quit".into()).spawn(move || {
+            taskkill(&exe, force);
+        });
+    }
+}
+
+pub(crate) fn bridge_run_history() -> Vec<String> {
+    load_run_history()
+}
+
+pub(crate) fn bridge_save_run_history(list: &[String]) {
+    save_run_history(list);
+}
+
+/// The installed apps (call from a background thread).
+pub(crate) fn bridge_apps() -> Vec<(String, String)> {
+    low_priority();
+    crate::dock::installed_apps()
+}
+
+/// The files and folders in the usual places and in `extra`, as (path, is a folder). Call from a background thread.
+pub(crate) fn bridge_files(extra: &[String]) -> Vec<(String, bool)> {
+    low_priority();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        for d in ["Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music"] {
+            roots.push(Path::new(&home).join(d));
+        }
+    }
+    if let Some(od) = std::env::var_os("OneDrive") {
+        for d in ["Desktop", "Documents", "Pictures"] {
+            roots.push(Path::new(&od).join(d));
+        }
+    }
+    roots.extend(extra.iter().map(PathBuf::from));
+    let mut roots: Vec<(PathBuf, PathBuf)> =
+        roots.into_iter().filter_map(|r| std::fs::canonicalize(&r).ok().map(|c| (c, r))).collect();
+    roots.sort_by(|a, b| a.0.cmp(&b.0));
+    roots.dedup_by(|a, b| a.0 == b.0);
+    let mut out: Vec<Entry> = Vec::new();
+    for (_, r) in &roots {
+        walk(r, &mut out);
+    }
+    out.into_iter().map(|e| (e.path.to_string(), e.kind == Kind::Folder)).collect()
 }
 
 /// Press Ctrl+V a moment from now, when the window that had the focus before has it back.

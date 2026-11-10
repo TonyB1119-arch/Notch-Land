@@ -38,6 +38,13 @@ const ZOOM: f32 = 0.15;
 /// ~22 frames per second is plenty for a mirror and keeps the cost low.
 const FRAME_GAP: Duration = Duration::from_millis(45);
 
+/// True while the camera view is open on the home page (or still shrinking away): the page is taller then.
+static SHOWING: AtomicBool = AtomicBool::new(false);
+
+pub fn showing() -> bool {
+    SHOWING.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, PartialEq)]
 enum State {
     Idle,
@@ -68,11 +75,14 @@ pub struct Mirror {
     page_seen: Instant,
     /// Bitmap of the frame on screen, so the old one can be released.
     drawn_id: Option<u64>,
+    /// How far the home page's camera view is open (0..1) and when it was last moved.
+    p: f32,
+    p_at: Instant,
 }
 
 impl Mirror {
     pub fn new() -> Self {
-        Self { state: State::Idle, frame: None, stop: None, gen: 0, page_seen: Instant::now(), drawn_id: None }
+        Self { state: State::Idle, frame: None, stop: None, gen: 0, page_seen: Instant::now(), drawn_id: None, p: 0.0, p_at: Instant::now() }
     }
 
     fn begin(&mut self, bus: &Bus) {
@@ -86,6 +96,7 @@ impl Mirror {
         self.state = State::Starting;
         self.frame = None;
         self.page_seen = Instant::now();
+        SHOWING.store(true, Ordering::Relaxed);
         let bus = bus.clone();
         if std::thread::Builder::new().name("mirror".into()).spawn(move || worker(gen, stop, bus)).is_err() {
             self.stop = None;
@@ -95,6 +106,9 @@ impl Mirror {
 
     /// Switch the camera off and drop the picture.
     fn shutdown(&mut self) {
+        if !crate::ui::look_alcove() {
+            SHOWING.store(false, Ordering::Relaxed);
+        }
         if let Some(s) = self.stop.take() {
             s.store(true, Ordering::Release);
         }
@@ -124,6 +138,9 @@ impl Module for Mirror {
         if let SystemEvent::Expanded(false) = ev {
             let was_on = self.stop.is_some();
             self.shutdown();
+            // the next time the page opens the view starts closed
+            self.p = 0.0;
+            SHOWING.store(false, Ordering::Relaxed);
             if was_on {
                 cx.fx.redraw = true;
             }
@@ -172,12 +189,15 @@ impl Module for Mirror {
         let limit = if self.state == State::Live { Duration::from_millis(1200) } else { Duration::from_secs(20) };
         if self.page_seen.elapsed() > limit {
             self.shutdown();
+            self.p = 0.0;
+            SHOWING.store(false, Ordering::Relaxed);
             cx.fx.redraw = true;
         }
     }
 
+    /// In the Alcove look the mirror lives on the home page instead of having a tab.
     fn has_page(&self) -> bool {
-        true
+        !crate::ui::look_alcove()
     }
 
     fn page_height(&self, _width: f32) -> f32 {
@@ -185,6 +205,105 @@ impl Module for Mirror {
             210.0
         } else {
             230.0
+        }
+    }
+
+    /// The mirror on the Alcove home page: a small camera icon beside the settings gear. Pressing it
+    /// grows a camera view out of the icon over the whole page (which gets taller for it); the close
+    /// button, leaving the page or closing the notch switches the camera off again. `r` is the home
+    /// page's whole content area.
+    fn draw_card(&mut self, ui: &mut Ui, r: Rect) {
+        let now = ui.now;
+        let open = self.stop.is_some();
+        if open {
+            self.page_seen = Instant::now();
+        }
+        // ease the view open or shut with a timer of its own (so it can start closed when the notch reopens)
+        let dt = now.saturating_duration_since(self.p_at).as_secs_f32().min(0.05);
+        self.p_at = now;
+        let want = if open { 1.0 } else { 0.0 };
+        if (self.p - want).abs() > 0.004 {
+            self.p += (want - self.p) * (1.0 - (-dt * 11.0).exp());
+            if (self.p - want).abs() <= 0.004 {
+                self.p = want;
+            }
+            ui.animate();
+        }
+        let p = self.p;
+        SHOWING.store(open || p > 0.01, Ordering::Relaxed);
+
+        // the camera icon, in the gear's style
+        let btn = Rect::new(r.x + 24.0, r.y - 8.0, 22.0, 22.0);
+        if p < 0.995 {
+            let hover = p < 0.02 && ui.hovered(btn.expand(4.0));
+            if hover {
+                ui.hot = true;
+            }
+            let a = ui.glide(gkey("mirror-btn", 0), if hover { 1.0 } else { 0.0 });
+            let outer = ui.p.alpha;
+            ui.p.alpha = outer * (1.0 - smoothstep(0.1, 0.5, p));
+            let failed = matches!(self.state, State::Failed(_));
+            let tint = if failed { Color::white(0.28) } else { Color::white(0.45 + 0.45 * a) };
+            ui.p.icon(Icon::Camera, btn, tint);
+            if let State::Failed(why) = &self.state {
+                ui.p.text(
+                    &format!("Camera unavailable. {why}"),
+                    Rect::new(btn.right() + 8.0, btn.y, 260.0, btn.h),
+                    &TextStyle::new(11.5, palette::TEXT_FAINT),
+                );
+            }
+            ui.p.alpha = outer;
+            if p < 0.02 && !open && ui.clicked(btn.expand(4.0)) {
+                let bus = ui.bus.clone();
+                self.begin(&bus);
+            }
+        }
+        if p <= 0.003 {
+            return;
+        }
+
+        // the view grows out of the icon and fills the page
+        let view = Rect::new(lerp(btn.x, r.x, p), lerp(btn.y, r.y, p), lerp(btn.w, r.w, p), lerp(btn.h, r.h, p));
+        let radius = lerp(btn.h * 0.5, 30.0, p);
+        let outer = ui.p.alpha;
+        ui.p.alpha = outer * smoothstep(0.0, 0.25, p);
+        ui.p.fill_rounded(view, radius, Color::hex(0x0B0B0D));
+        ui.p.alpha = outer;
+        let show = smoothstep(0.55, 0.95, p);
+        if show > 0.01 {
+            ui.p.alpha = outer * show;
+            ui.p.push_clip(view);
+            match &self.frame {
+                Some(img) => {
+                    // release the previous frame's GPU copy right away
+                    if self.drawn_id != Some(img.id) {
+                        if let Some(old) = self.drawn_id.replace(img.id) {
+                            ui.p.forget_image(old);
+                        }
+                    }
+                    ui.p.image_zoom(img, view, radius, 1.0, ZOOM);
+                    // a small red dot shows the camera is live
+                    ui.p.fill_circle(view.x + 24.0, view.y + 24.0, 5.0, palette::RED);
+                }
+                None => {
+                    ui.p.text(
+                        "Starting camera…",
+                        Rect::new(view.x, view.cy() - 22.0, view.w, 20.0),
+                        &TextStyle::new(13.0, palette::TEXT_DIM).center(),
+                    );
+                    ui.ticks_sweep(Rect::new(view.cx() - 50.0, view.cy() + 6.0, 100.0, 10.0), Color::white(0.9));
+                }
+            }
+            ui.p.pop_clip();
+            ui.p.stroke_rounded(view.inset(0.5), radius, 1.0, Color::white(0.10));
+            if open && p > 0.97 {
+                let close = Rect::new(view.right() - 38.0, view.y + 10.0, 28.0, 28.0);
+                if ui.icon_button(close, Icon::Close, ButtonStyle::filled(Color::black(0.55)).scale(0.5)) {
+                    self.shutdown();
+                    ui.fx.redraw = true;
+                }
+            }
+            ui.p.alpha = outer;
         }
     }
 

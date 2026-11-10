@@ -32,6 +32,9 @@ const KEY_PAGE_H: f32 = 170.0;
 /// Sent by the settings page after it saved or removed the API key.
 pub struct KeyChanged;
 
+/// A question from the Alcove launcher: it is asked at once.
+pub struct Ask(pub String);
+
 enum GMsg {
     Delta(u64, String),
     Done(u64),
@@ -261,6 +264,18 @@ impl Module for Gemini {
     }
 
     fn on_message(&mut self, msg: Box<dyn Any + Send>, cx: &mut Cx) {
+        let msg = match msg.downcast::<Ask>() {
+            Ok(a) => {
+                self.input.set(&a.0);
+                if !self.key_form() {
+                    self.submit();
+                }
+                cx.fx.layout_changed = true;
+                cx.fx.redraw = true;
+                return;
+            }
+            Err(m) => m,
+        };
         let msg = match msg.downcast::<KeyChanged>() {
             Ok(_) => {
                 self.has_key = dotenv::get_saved_first(KEY_VAR).is_some();

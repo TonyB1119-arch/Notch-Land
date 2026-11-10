@@ -66,7 +66,7 @@ impl Module for Greeting {
         // (or "Hello <your name>", from Settings → General) in handwriting.
         let name: String = cx.cfg.greeting.name.trim().chars().take(24).collect();
         let title = if name.is_empty() { "Hello".to_string() } else { format!("Hello {name}") };
-        let peek = Peek::new(Icon::Unlock, Color::hex(0x007AFF), title, "").scan().duration_ms(5200);
+        let peek = Peek::new(Icon::Unlock, Color::hex(0x007AFF), title, "").scan().duration_ms(if crate::ui::look_alcove() { 2100 } else { 5200 });
         cx.fx.peek(peek.key("greeting"));
         cx.fx.redraw = true;
     }

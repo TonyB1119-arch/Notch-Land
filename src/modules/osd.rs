@@ -339,7 +339,7 @@ impl Module for Osd {
                     let first = self.mic_muted.is_none();
                     self.mic_muted = Some(muted);
                     if !first && cx.cfg.osd.volume {
-                        let (color, text) = if muted { (palette::PINK, "Muted") } else { (palette::BLUE, "On") };
+                        let (color, text) = if muted { (palette::PINK, "Muted") } else { (palette::BLUE, "Unmuted") };
                         cx.fx.peek(
                             Peek::new(Icon::Mic, color, "Microphone", text).key("osd-mic").duration_ms(1800).instant(),
                         );
