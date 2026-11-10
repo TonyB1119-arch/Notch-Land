@@ -19,10 +19,10 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
-windows-numerics = "0.3"
-windows-future = "0.3"
-windows-core = "0.62"
-windows-collections = "0.3"
+windows-numerics = "0.100"
+windows-future = "0.100"
+windows-core = "0.100"
+windows-collections = "0.100"
 
 [dependencies.windows]
 version = "0.62"
