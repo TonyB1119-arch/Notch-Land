@@ -1,0 +1,53 @@
+name: Build and release
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: Release notes
+        default: "Automatic build"
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    outputs:
+      n: ${{ steps.ver.outputs.n }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply the patches
+        run: python3 tools/apply_patches.py
+      - name: Next version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh release list --limit 1 --json tagName -q '.[0].tagName')
+          n=$(( ${last##*.} + 1 ))
+          sed -i 's/^version = "3\.0\.[0-9]*"/version = "3.0.'"$n"'"/' Cargo.toml
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+      - name: Save to the branch
+        run: |
+          git config user.name "build bot"
+          git config user.email "build-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "Build 3.0.${{ steps.ver.outputs.n }}" || true
+          git push
+  build:
+    needs: patch
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          printf '%s\n' "$NOTES" > notes.md
+          gh release create "v3.0.${{ needs.patch.outputs.n }}" target/release/dynamic-notch.exe --title "v3.0.${{ needs.patch.outputs.n }}" --notes-file notes.md
